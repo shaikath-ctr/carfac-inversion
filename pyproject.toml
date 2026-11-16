@@ -1,0 +1,78 @@
+[project]
+name = "carfac-inversion"
+version = "0.1.0"
+description = "Physics-based DSP warm start and differentiable JAX inversion from CARFAC neural activity patterns (NAPs) back to audio."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+dependencies = [
+    "absl-py>=1.4.0",
+    "carfac[jax]",
+    "hp-acoustic",
+    "jax>=0.10.1,<0.11",
+    "jaxlib>=0.10.1,<0.11",
+    "numpy>=1.26",
+    "optax>=0.2.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/carfac_inversion"]
+
+[tool.ruff]
+line-length = 80
+indent-width = 2
+target-version = "py311"
+
+[tool.ruff.format]
+quote-style = "preserve"
+indent-style = "space"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "PLC", "PLE", "PLW", "RUF100", "D"]
+ignore = ["PLW0603", "PLW0120"]
+
+[tool.ruff.lint.per-file-ignores]
+"*_test.py" = ["D"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.pycodestyle]
+max-line-length = 100
+
+[tool.ruff.lint.isort]
+force-single-line = true
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.6.2",
+    "pyrefly>=1.2.0",
+    "pytest>=8.3.5",
+    "pytest-xdist>=3.8.0",
+    "ruff>=0.15.21",
+]
+
+[tool.uv.sources]
+carfac = { git = "https://github.com/google/carfac", rev = "4cdb95eefd2161bc0c64566d2ee3f05637a00d51", subdirectory = "python" }
+hp-acoustic = { git = "https://github.com/Australian-Future-Hearing-Initiative/hp-acoustic", rev = "7d913ac89445d7cf73ac2589c8889b6e75d216ff" }
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
+[tool.pyrefly]
+project-includes = ["src/carfac_inversion"]
+search-path = ["src"]
+python-version = "3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["src/carfac_inversion"]
+addopts = "--import-mode=importlib -n auto"

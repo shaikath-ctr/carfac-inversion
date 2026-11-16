@@ -1,0 +1,31 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Pytest
+.pytest_cache/
+.coverage
+
+# Ruff
+.ruff_cache/
+
+# Editors & OS
+.idea/
+.vscode/
+.DS_Store
+
+# Audio & generated artifacts
+*.wav
+*.npy
+*.npz
+*.png
+output/
+tmp/
+runs/

@@ -1,0 +1,74 @@
+name: Python CI with uv
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (ruff & pyrefly)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure git authentication for private dependencies
+        env:
+          AFHI_CI_PAT: ${{ secrets.AFHI_CI_PAT }}
+        run: |
+          if [ -n "$AFHI_CI_PAT" ]; then
+            git config --global url."https://x-access-token:${AFHI_CI_PAT}@github.com/".insteadOf "https://github.com/"
+          fi
+
+      - name: Install uv with cache
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Run ruff format --check
+        run: uv run ruff format --check .
+
+      - name: Run ruff check
+        run: uv run ruff check .
+
+      - name: Run pyrefly check
+        run: uv run pyrefly check
+
+  test:
+    name: Tests (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure git authentication for private dependencies
+        env:
+          AFHI_CI_PAT: ${{ secrets.AFHI_CI_PAT }}
+        run: |
+          if [ -n "$AFHI_CI_PAT" ]; then
+            git config --global url."https://x-access-token:${AFHI_CI_PAT}@github.com/".insteadOf "https://github.com/"
+          fi
+
+      - name: Install uv with cache
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Run tests
+        run: uv run pytest -v
