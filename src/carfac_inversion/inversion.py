@@ -4,10 +4,11 @@ Combines a physics-based basilar-membrane matched-filter warm start with
 scale-invariant JAX gradient optimization (Adam + L-BFGS) through a
 differentiable ``CochleaModel``. Supports both same-cochlea round-trip
 reconstruction (``mode="exact"``) and cross-cochlea hearing-loss auralization
-(``mode="perceptual"``).
+(``mode="perceptual"``), with fixed-window overlap-add chunking for long clips.
 """
 
 import dataclasses
+import functools
 import logging
 import math
 from typing import Literal
@@ -66,9 +67,19 @@ class InversionConfig:
       ``min(0.48 * sample_rate_hz, 1.15 * max_cf_hz)`` for CARFAC models.
     hf_env_weight: Weight of the >3.5 kHz smoothed-envelope term in ``"exact"``
       mode.
+    perceptual_nap_weight: Weight on the direct sample-level NAP anchor in
+      ``"perceptual"`` mode (the remainder weights envelopes and SAI).
     adam_lr_scale: Initial Adam step size as a fraction of the initial waveform
       RMS.
     lbfgs_memory_size: History size for L-BFGS inverse Hessian approximation.
+    chunk_seconds: Fixed optimization window duration in seconds for
+      overlap-add processing when input length exceeds one window, or ``None``
+      to optimize the full clip in one graph.
+    chunk_overlap_s: Cosine-squared crossfade overlap between adjacent windows
+      in seconds when chunking is active.
+    chunk_preroll_s: Frozen preceding-audio context in seconds prepended to
+      each chunk so CARFAC traveling-wave and AGC states are warmed up before
+      scoring the chunk window.
     seed: Random seed for high-frequency warm-start noise carriers.
   """
 
@@ -81,8 +92,12 @@ class InversionConfig:
   cutoff_low_hz: float = 60.0
   cutoff_high_hz: float | None = None
   hf_env_weight: float = 0.005
+  perceptual_nap_weight: float = 0.10
   adam_lr_scale: float = 0.08
   lbfgs_memory_size: int = 15
+  chunk_seconds: float | None = 1.5
+  chunk_overlap_s: float = 0.128
+  chunk_preroll_s: float = 0.064
   seed: int = 0
 
   def __post_init__(self) -> None:
@@ -120,6 +135,11 @@ class InversionConfig:
       raise ValueError(
         f"hf_env_weight must be non-negative, got {self.hf_env_weight}"
       )
+    if not 0.0 <= self.perceptual_nap_weight <= 1.0:
+      raise ValueError(
+        "perceptual_nap_weight must be in [0, 1], got "
+        f"{self.perceptual_nap_weight}"
+      )
     if self.adam_lr_scale <= 0.0:
       raise ValueError(
         f"adam_lr_scale must be positive, got {self.adam_lr_scale}"
@@ -127,6 +147,26 @@ class InversionConfig:
     if self.lbfgs_memory_size < 1:
       raise ValueError(
         f"lbfgs_memory_size must be at least 1, got {self.lbfgs_memory_size}"
+      )
+    if self.chunk_seconds is not None and self.chunk_seconds <= 0.0:
+      raise ValueError(
+        f"chunk_seconds must be positive or None, got {self.chunk_seconds}"
+      )
+    if self.chunk_overlap_s < 0.0:
+      raise ValueError(
+        f"chunk_overlap_s must be non-negative, got {self.chunk_overlap_s}"
+      )
+    if self.chunk_preroll_s < 0.0:
+      raise ValueError(
+        f"chunk_preroll_s must be non-negative, got {self.chunk_preroll_s}"
+      )
+    if (
+      self.chunk_seconds is not None
+      and self.chunk_overlap_s >= self.chunk_seconds
+    ):
+      raise ValueError(
+        "chunk_overlap_s must be strictly less than chunk_seconds, got "
+        f"{self.chunk_overlap_s} >= {self.chunk_seconds}"
       )
 
 
@@ -141,10 +181,9 @@ class NapInversionResult:
       shape as ``waveform``.
     reconstructed_nap: Forward cochlea output evaluated on ``waveform``, same
       shape as the input ``target_nap``.
-    loss_history: Objective value at each optimization step (Adam followed by
-      L-BFGS).
-    final_loss: Minimum objective value achieved across optimization (or initial
-      objective when optimization steps are zero).
+    loss_history: Objective value at each optimization step (concatenated across
+      windows when chunking is active).
+    final_loss: Objective value achieved on the final full-clip output.
     sample_rate_hz: Cochlea sample rate in Hz.
   """
 
@@ -203,17 +242,7 @@ def _measure_carfac_bm_irs(
   ir_len: int,
   ohc_scale: float = 1.0,
 ) -> np.ndarray:
-  """Measures open-loop CARFAC basilar-membrane impulse responses.
-
-  Args:
-    cochlea_model: Target CARFAC cochlea model.
-    ir_len: Impulse response length in samples.
-    ohc_scale: Multiplier in ``(0, 1]`` applied to OHC undamping so loud
-      signals use an AGC-damped operating Q for the linear inverse filter.
-
-  Returns:
-    Array of shape ``(ir_len, num_channels, num_ears)``.
-  """
+  """Measures open-loop CARFAC basilar-membrane impulse responses."""
   num_ears = len(cochlea_model.hypers.ears)
   imp = jnp.zeros((ir_len, num_ears), dtype=jnp.float32)
   imp = imp.at[0, :].set(_IMPULSE_AMPLITUDE)
@@ -272,6 +301,22 @@ def _ihc_lpf_inverse(
   return np.conj(h_lpf) / (np.abs(h_lpf) ** 2 + 0.05)
 
 
+@jax.jit
+def _eval_pytree_rms_err(
+  gain: jnp.ndarray,
+  unit_waveform: jnp.ndarray,
+  target_ch_rms: jnp.ndarray,
+  rest_nap_j: jnp.ndarray,
+  cochlea_model: cochlea.CochleaModel,
+) -> jnp.ndarray:
+  """Evaluates per-channel positive NAP RMS mismatch for a PyTree cochlea."""
+  pred_centered = cochlea_model(gain * unit_waveform) - rest_nap_j
+  pred_ch_rms = jnp.sqrt(
+    jnp.mean(jnp.maximum(pred_centered, 0.0) ** 2, axis=(0, 2)) + 1e-8
+  )
+  return jnp.mean((pred_ch_rms - target_ch_rms) ** 2)
+
+
 def _calibrate_scalar_gain(
   unit_waveform: jnp.ndarray,
   target_centered_j: jnp.ndarray,
@@ -283,28 +328,33 @@ def _calibrate_scalar_gain(
   target_ch_rms = jnp.sqrt(
     jnp.mean(jnp.maximum(target_centered_j, 0.0) ** 2, axis=(0, 2)) + 1e-8
   )
+  is_pytree = not jax.tree_util.treedef_is_leaf(
+    jax.tree_util.tree_structure(cochlea_model)
+  )
 
-  @jax.jit
-  def eval_rms_err(gain: jnp.ndarray) -> jnp.ndarray:
-    pred_centered = cochlea_model(gain * unit_waveform) - rest_nap_j
+  def eval_err(gain_val: float) -> float:
+    g_j = jnp.float32(gain_val)
+    if is_pytree:
+      return float(
+        _eval_pytree_rms_err(
+          g_j, unit_waveform, target_ch_rms, rest_nap_j, cochlea_model
+        )
+      )
+    pred_centered = cochlea_model(g_j * unit_waveform) - rest_nap_j
     pred_ch_rms = jnp.sqrt(
       jnp.mean(jnp.maximum(pred_centered, 0.0) ** 2, axis=(0, 2)) + 1e-8
     )
-    return jnp.mean((pred_ch_rms - target_ch_rms) ** 2)
+    return float(jnp.mean((pred_ch_rms - target_ch_rms) ** 2))
 
   if center_rms is None:
     coarse = np.geomspace(5e-5, 0.4, 14)
     best_gain = float(
-      coarse[
-        int(np.argmin([float(eval_rms_err(jnp.float32(g))) for g in coarse]))
-      ]
+      coarse[int(np.argmin([eval_err(float(g)) for g in coarse]))]
     )
     fine = np.geomspace(best_gain * 0.65, best_gain * 1.55, 7)
   else:
     fine = np.geomspace(max(center_rms * 0.5, 1e-6), center_rms * 2.0, 7)
-  return float(
-    fine[int(np.argmin([float(eval_rms_err(jnp.float32(g))) for g in fine]))]
-  )
+  return float(fine[int(np.argmin([eval_err(float(g)) for g in fine]))])
 
 
 def _carfac_dsp_warm_start(
@@ -563,6 +613,580 @@ def _audible_band_mask(
   return jnp.asarray(mask[:, np.newaxis], dtype=jnp.float32)
 
 
+def _project_wave(
+  wave_2d: jnp.ndarray,
+  band_mask_j: jnp.ndarray,
+  num_samples: int,
+) -> jnp.ndarray:
+  """Projects a 2D waveform onto the audible frequency band via rFFT."""
+  spec = jnp.fft.rfft(wave_2d, axis=0) * band_mask_j
+  return jnp.fft.irfft(spec, n=num_samples, axis=0).astype(jnp.float32)
+
+
+def _window_loss_impl(
+  wave_2d: jnp.ndarray,
+  cochlea_model: cochlea.CochleaModel,
+  prefix_2d: jnp.ndarray,
+  target_j: jnp.ndarray,
+  rest_nap_j: jnp.ndarray,
+  band_mask_j: jnp.ndarray,
+  target_env_f: jnp.ndarray,
+  target_env_s: jnp.ndarray,
+  target_sai: jnp.ndarray,
+  hf_mask_j: jnp.ndarray,
+  ch_scale: jnp.ndarray,
+  nap_var: jnp.ndarray,
+  env_var: jnp.ndarray,
+  sai_var: jnp.ndarray,
+  hf_env_weight: jnp.ndarray,
+  perceptual_nap_weight: jnp.ndarray,
+  *,
+  mode: InversionMode,
+  use_hf_env: bool,
+  apply_drift_loss: bool,
+  use_sai: bool,
+  sai_fft_len: int,
+  win_fast: int,
+  win_slow: int,
+  fs_int: int,
+  num_samples: int,
+  preroll_samples: int,
+) -> jnp.ndarray:
+  """Evaluates the inversion objective for a single window (or full clip)."""
+  projected = _project_wave(wave_2d, band_mask_j, num_samples)
+  if preroll_samples > 0:
+    full_wave = jnp.concatenate(
+      [jax.lax.stop_gradient(prefix_2d), projected], axis=0
+    )
+    pred = cochlea_model(full_wave)[preroll_samples:]
+  else:
+    pred = cochlea_model(projected)
+
+  if mode == "exact":
+    loss = jnp.mean((pred - target_j) ** 2) / nap_var
+    if use_hf_env:
+      pred_env = _smooth_time_boxcar(
+        jnp.maximum(pred - rest_nap_j, 0.0), win_fast
+      )
+      hf_err = jnp.mean(hf_mask_j * ((pred_env - target_env_f) / ch_scale) ** 2)
+      loss = loss + hf_env_weight * hf_err
+    if apply_drift_loss:
+      loss = loss + waveform_losses.low_frequency_drift_penalty(
+        projected, sample_rate=fs_int
+      )
+    return loss
+
+  pred_pos = jnp.maximum(pred - rest_nap_j, 0.0)
+  pred_env_f = _smooth_time_boxcar(pred_pos, win_fast)
+  pred_env_s = _smooth_time_boxcar(pred_pos, win_slow)
+  env_loss = (
+    jnp.mean((pred_env_f - target_env_f) ** 2)
+    + jnp.mean((pred_env_s - target_env_s) ** 2)
+  ) / (2.0 * env_var)
+  nap_loss = jnp.mean((pred - target_j) ** 2) / nap_var
+  if use_sai:
+    sai_hypers = sai.SaiHypers(fft_len=sai_fft_len)
+    pred_sai = sai.from_naps(jnp.transpose(pred, (2, 0, 1)), sai_hypers)
+    sai_loss = jnp.mean((pred_sai - target_sai) ** 2) / sai_var
+    remaining = jnp.maximum(0.0, 1.0 - perceptual_nap_weight)
+    env_w = remaining * (0.65 / 0.90)
+    sai_w = remaining * (0.25 / 0.90)
+    return (
+      env_w * env_loss + sai_w * sai_loss + perceptual_nap_weight * nap_loss
+    )
+  return (1.0 - perceptual_nap_weight) * env_loss + (
+    perceptual_nap_weight * nap_loss
+  )
+
+
+_ADAM_TRANSFORM = optax.chain(
+  optax.clip_by_global_norm(1.0), optax.scale_by_adam()
+)
+
+_STATIC_WINDOW_ARGS = (
+  "mode",
+  "use_hf_env",
+  "apply_drift_loss",
+  "use_sai",
+  "sai_fft_len",
+  "win_fast",
+  "win_slow",
+  "fs_int",
+  "num_samples",
+  "preroll_samples",
+)
+
+
+@functools.partial(jax.jit, static_argnames=_STATIC_WINDOW_ARGS)
+def _eval_window_loss_jit(
+  wave_2d: jnp.ndarray,
+  cochlea_model: cochlea.CochleaModel,
+  prefix_2d: jnp.ndarray,
+  target_j: jnp.ndarray,
+  rest_nap_j: jnp.ndarray,
+  band_mask_j: jnp.ndarray,
+  target_env_f: jnp.ndarray,
+  target_env_s: jnp.ndarray,
+  target_sai: jnp.ndarray,
+  hf_mask_j: jnp.ndarray,
+  ch_scale: jnp.ndarray,
+  nap_var: jnp.ndarray,
+  env_var: jnp.ndarray,
+  sai_var: jnp.ndarray,
+  hf_env_weight: jnp.ndarray,
+  perceptual_nap_weight: jnp.ndarray,
+  *,
+  mode: InversionMode,
+  use_hf_env: bool,
+  apply_drift_loss: bool,
+  use_sai: bool,
+  sai_fft_len: int,
+  win_fast: int,
+  win_slow: int,
+  fs_int: int,
+  num_samples: int,
+  preroll_samples: int,
+) -> jnp.ndarray:
+  """Module-level JIT loss evaluation reusing XLA across chunks and clips."""
+  return _window_loss_impl(
+    wave_2d,
+    cochlea_model,
+    prefix_2d,
+    target_j,
+    rest_nap_j,
+    band_mask_j,
+    target_env_f,
+    target_env_s,
+    target_sai,
+    hf_mask_j,
+    ch_scale,
+    nap_var,
+    env_var,
+    sai_var,
+    hf_env_weight,
+    perceptual_nap_weight,
+    mode=mode,
+    use_hf_env=use_hf_env,
+    apply_drift_loss=apply_drift_loss,
+    use_sai=use_sai,
+    sai_fft_len=sai_fft_len,
+    win_fast=win_fast,
+    win_slow=win_slow,
+    fs_int=fs_int,
+    num_samples=num_samples,
+    preroll_samples=preroll_samples,
+  )
+
+
+@functools.partial(jax.jit, static_argnames=_STATIC_WINDOW_ARGS)
+def _adam_window_step_jit(
+  wave_2d: jnp.ndarray,
+  adam_state: optax.OptState,
+  step_lr: jnp.ndarray,
+  cochlea_model: cochlea.CochleaModel,
+  prefix_2d: jnp.ndarray,
+  target_j: jnp.ndarray,
+  rest_nap_j: jnp.ndarray,
+  band_mask_j: jnp.ndarray,
+  target_env_f: jnp.ndarray,
+  target_env_s: jnp.ndarray,
+  target_sai: jnp.ndarray,
+  hf_mask_j: jnp.ndarray,
+  ch_scale: jnp.ndarray,
+  nap_var: jnp.ndarray,
+  env_var: jnp.ndarray,
+  sai_var: jnp.ndarray,
+  hf_env_weight: jnp.ndarray,
+  perceptual_nap_weight: jnp.ndarray,
+  *,
+  mode: InversionMode,
+  use_hf_env: bool,
+  apply_drift_loss: bool,
+  use_sai: bool,
+  sai_fft_len: int,
+  win_fast: int,
+  win_slow: int,
+  fs_int: int,
+  num_samples: int,
+  preroll_samples: int,
+) -> tuple[jnp.ndarray, optax.OptState, jnp.ndarray]:
+  """Module-level JIT Adam step reusing XLA across chunks and clips."""
+
+  def loss_w(w: jnp.ndarray) -> jnp.ndarray:
+    return _window_loss_impl(
+      w,
+      cochlea_model,
+      prefix_2d,
+      target_j,
+      rest_nap_j,
+      band_mask_j,
+      target_env_f,
+      target_env_s,
+      target_sai,
+      hf_mask_j,
+      ch_scale,
+      nap_var,
+      env_var,
+      sai_var,
+      hf_env_weight,
+      perceptual_nap_weight,
+      mode=mode,
+      use_hf_env=use_hf_env,
+      apply_drift_loss=apply_drift_loss,
+      use_sai=use_sai,
+      sai_fft_len=sai_fft_len,
+      win_fast=win_fast,
+      win_slow=win_slow,
+      fs_int=fs_int,
+      num_samples=num_samples,
+      preroll_samples=preroll_samples,
+    )
+
+  val, grads = jax.value_and_grad(loss_w)(wave_2d)
+  updates, next_state = _ADAM_TRANSFORM.update(grads, adam_state, wave_2d)
+  # Scale by -step_lr because _ADAM_TRANSFORM omits the learning-rate factor.
+  next_w = _project_wave(wave_2d - step_lr * updates, band_mask_j, num_samples)
+  return next_w, next_state, val
+
+
+@functools.partial(
+  jax.jit, static_argnames=_STATIC_WINDOW_ARGS + ("lbfgs_memory_size",)
+)
+def _lbfgs_window_step_jit(
+  u_curr: jnp.ndarray,
+  lbfgs_state: optax.OptState,
+  u_scale: jnp.ndarray,
+  cochlea_model: cochlea.CochleaModel,
+  prefix_2d: jnp.ndarray,
+  target_j: jnp.ndarray,
+  rest_nap_j: jnp.ndarray,
+  band_mask_j: jnp.ndarray,
+  target_env_f: jnp.ndarray,
+  target_env_s: jnp.ndarray,
+  target_sai: jnp.ndarray,
+  hf_mask_j: jnp.ndarray,
+  ch_scale: jnp.ndarray,
+  nap_var: jnp.ndarray,
+  env_var: jnp.ndarray,
+  sai_var: jnp.ndarray,
+  hf_env_weight: jnp.ndarray,
+  perceptual_nap_weight: jnp.ndarray,
+  *,
+  mode: InversionMode,
+  use_hf_env: bool,
+  apply_drift_loss: bool,
+  use_sai: bool,
+  sai_fft_len: int,
+  win_fast: int,
+  win_slow: int,
+  fs_int: int,
+  num_samples: int,
+  preroll_samples: int,
+  lbfgs_memory_size: int,
+) -> tuple[jnp.ndarray, optax.OptState, jnp.ndarray]:
+  """Module-level JIT L-BFGS step reusing XLA across chunks and clips."""
+
+  def loss_scaled(u: jnp.ndarray) -> jnp.ndarray:
+    return _window_loss_impl(
+      u * u_scale,
+      cochlea_model,
+      prefix_2d,
+      target_j,
+      rest_nap_j,
+      band_mask_j,
+      target_env_f,
+      target_env_s,
+      target_sai,
+      hf_mask_j,
+      ch_scale,
+      nap_var,
+      env_var,
+      sai_var,
+      hf_env_weight,
+      perceptual_nap_weight,
+      mode=mode,
+      use_hf_env=use_hf_env,
+      apply_drift_loss=apply_drift_loss,
+      use_sai=use_sai,
+      sai_fft_len=sai_fft_len,
+      win_fast=win_fast,
+      win_slow=win_slow,
+      fs_int=fs_int,
+      num_samples=num_samples,
+      preroll_samples=preroll_samples,
+    )
+
+  lbfgs_opt = optax.lbfgs(learning_rate=1.0, memory_size=lbfgs_memory_size)
+  val, grads = jax.value_and_grad(loss_scaled)(u_curr)
+  updates, next_state = lbfgs_opt.update(
+    grads, lbfgs_state, u_curr, value=val, grad=grads, value_fn=loss_scaled
+  )
+  next_u = _project_wave(
+    optax.apply_updates(u_curr, updates), band_mask_j, num_samples
+  )
+  return next_u, next_state, val
+
+
+def _optimize_window(
+  init_2d: np.ndarray,
+  target_j: jnp.ndarray,
+  prefix_2d: jnp.ndarray,
+  rest_nap_j: jnp.ndarray,
+  band_mask_j: jnp.ndarray,
+  hf_mask_j: jnp.ndarray,
+  cochlea_model: cochlea.CochleaModel,
+  config: InversionConfig,
+  *,
+  is_pytree: bool,
+  fs_int: int,
+  win_fast: int,
+  win_slow: int,
+  sai_fft_len: int,
+  use_sai: bool,
+) -> tuple[jnp.ndarray, list[float]]:
+  """Optimizes one waveform window (or full clip when unchunked)."""
+  num_samples = int(target_j.shape[0])
+  nap_var = jnp.maximum(jnp.mean((target_j - rest_nap_j) ** 2), 1e-6)
+  target_pos = jnp.maximum(target_j - rest_nap_j, 0.0)
+  target_env_f = _smooth_time_boxcar(target_pos, win_fast)
+  target_env_s = _smooth_time_boxcar(target_pos, win_slow)
+  env_var = jnp.maximum(jnp.mean(target_env_f**2), 1e-6)
+
+  ch_rms = jnp.sqrt(jnp.mean(target_j**2, axis=(0, 2), keepdims=True))
+  ch_scale = jnp.maximum(ch_rms, 0.02)
+
+  if use_sai:
+    sai_hypers = sai.SaiHypers(fft_len=sai_fft_len)
+    target_sai = jax.lax.stop_gradient(
+      sai.from_naps(jnp.transpose(target_j, (2, 0, 1)), sai_hypers)
+    )
+    sai_var = jnp.maximum(jnp.mean(target_sai**2), 1e-6)
+  else:
+    target_sai = jnp.zeros((1, 1, 1, 1), dtype=jnp.float32)
+    sai_var = jnp.float32(1.0)
+
+  hf_env_w_j = jnp.float32(config.hf_env_weight)
+  perc_nap_w_j = jnp.float32(config.perceptual_nap_weight)
+  use_hf_env = config.hf_env_weight > 0.0
+  apply_drift_loss = config.cutoff_low_hz <= 0.0
+  preroll_samples = int(prefix_2d.shape[0])
+
+  if is_pytree:
+
+    def eval_fn(w: jnp.ndarray) -> jnp.ndarray:
+      return _eval_window_loss_jit(
+        w,
+        cochlea_model,
+        prefix_2d,
+        target_j,
+        rest_nap_j,
+        band_mask_j,
+        target_env_f,
+        target_env_s,
+        target_sai,
+        hf_mask_j,
+        ch_scale,
+        nap_var,
+        env_var,
+        sai_var,
+        hf_env_w_j,
+        perc_nap_w_j,
+        mode=config.mode,
+        use_hf_env=use_hf_env,
+        apply_drift_loss=apply_drift_loss,
+        use_sai=use_sai,
+        sai_fft_len=sai_fft_len,
+        win_fast=win_fast,
+        win_slow=win_slow,
+        fs_int=fs_int,
+        num_samples=num_samples,
+        preroll_samples=preroll_samples,
+      )
+  else:
+
+    def local_loss(w: jnp.ndarray) -> jnp.ndarray:
+      return _window_loss_impl(
+        w,
+        cochlea_model,
+        prefix_2d,
+        target_j,
+        rest_nap_j,
+        band_mask_j,
+        target_env_f,
+        target_env_s,
+        target_sai,
+        hf_mask_j,
+        ch_scale,
+        nap_var,
+        env_var,
+        sai_var,
+        hf_env_w_j,
+        perc_nap_w_j,
+        mode=config.mode,
+        use_hf_env=use_hf_env,
+        apply_drift_loss=apply_drift_loss,
+        use_sai=use_sai,
+        sai_fft_len=sai_fft_len,
+        win_fast=win_fast,
+        win_slow=win_slow,
+        fs_int=fs_int,
+        num_samples=num_samples,
+        preroll_samples=preroll_samples,
+      )
+
+    eval_fn = jax.jit(local_loss)
+
+  current_w = _project_wave(
+    jnp.asarray(init_2d, dtype=jnp.float32), band_mask_j, num_samples
+  )
+  best_w = current_w
+  best_loss = float(eval_fn(current_w))
+  loss_history: list[float] = []
+
+  if config.adam_steps > 0:
+    rms0 = max(float(jnp.sqrt(jnp.mean(current_w**2))), 1e-5)
+    init_lr = config.adam_lr_scale * rms0
+    adam_state = _ADAM_TRANSFORM.init(current_w)
+
+    if not is_pytree:
+      local_vg = jax.value_and_grad(eval_fn)
+
+      @jax.jit
+      def local_adam_step(
+        w: jnp.ndarray, state: optax.OptState, lr_val: jnp.ndarray
+      ) -> tuple[jnp.ndarray, optax.OptState, jnp.ndarray]:
+        val, grads = local_vg(w)
+        updates, next_state = _ADAM_TRANSFORM.update(grads, state, w)
+        return (
+          _project_wave(w - lr_val * updates, band_mask_j, num_samples),
+          next_state,
+          val,
+        )
+
+    for step_idx in range(config.adam_steps):
+      cosine = 0.5 * (
+        1.0 + math.cos(math.pi * step_idx / max(1, config.adam_steps))
+      )
+      step_lr = jnp.float32(init_lr * (0.05 + 0.95 * cosine))
+      if is_pytree:
+        current_w, adam_state, val = _adam_window_step_jit(
+          current_w,
+          adam_state,
+          step_lr,
+          cochlea_model,
+          prefix_2d,
+          target_j,
+          rest_nap_j,
+          band_mask_j,
+          target_env_f,
+          target_env_s,
+          target_sai,
+          hf_mask_j,
+          ch_scale,
+          nap_var,
+          env_var,
+          sai_var,
+          hf_env_w_j,
+          perc_nap_w_j,
+          mode=config.mode,
+          use_hf_env=use_hf_env,
+          apply_drift_loss=apply_drift_loss,
+          use_sai=use_sai,
+          sai_fft_len=sai_fft_len,
+          win_fast=win_fast,
+          win_slow=win_slow,
+          fs_int=fs_int,
+          num_samples=num_samples,
+          preroll_samples=preroll_samples,
+        )
+      else:
+        current_w, adam_state, val = local_adam_step(
+          current_w, adam_state, step_lr
+        )
+      val_f = float(val)
+      loss_history.append(val_f)
+      if math.isfinite(val_f) and val_f < best_loss:
+        best_loss = val_f
+        best_w = current_w
+
+  if config.lbfgs_steps > 0:
+    # Normalize parameters to O(1) RMS so L-BFGS's identity Hessian matches scale.
+    u_rms = float(jnp.sqrt(jnp.mean(best_w**2)))
+    u_scale_val = 1e-2 if u_rms < 1e-8 else max(u_rms, 1e-5)
+    u_scale_j = jnp.float32(u_scale_val)
+    u_curr = best_w / u_scale_j
+    lbfgs_opt = optax.lbfgs(
+      learning_rate=1.0, memory_size=config.lbfgs_memory_size
+    )
+    lbfgs_state = lbfgs_opt.init(u_curr)
+
+    if not is_pytree:
+
+      def local_scaled(u: jnp.ndarray) -> jnp.ndarray:
+        return eval_fn(u * u_scale_j)
+
+      local_lbfgs_vg = jax.value_and_grad(local_scaled)
+
+      @jax.jit
+      def local_lbfgs_step(
+        u: jnp.ndarray, state: optax.OptState
+      ) -> tuple[jnp.ndarray, optax.OptState, jnp.ndarray]:
+        val, grads = local_lbfgs_vg(u)
+        updates, next_state = lbfgs_opt.update(
+          grads, state, u, value=val, grad=grads, value_fn=local_scaled
+        )
+        return (
+          _project_wave(
+            optax.apply_updates(u, updates), band_mask_j, num_samples
+          ),
+          next_state,
+          val,
+        )
+
+    for _ in range(config.lbfgs_steps):
+      if is_pytree:
+        u_curr, lbfgs_state, val = _lbfgs_window_step_jit(
+          u_curr,
+          lbfgs_state,
+          u_scale_j,
+          cochlea_model,
+          prefix_2d,
+          target_j,
+          rest_nap_j,
+          band_mask_j,
+          target_env_f,
+          target_env_s,
+          target_sai,
+          hf_mask_j,
+          ch_scale,
+          nap_var,
+          env_var,
+          sai_var,
+          hf_env_w_j,
+          perc_nap_w_j,
+          mode=config.mode,
+          use_hf_env=use_hf_env,
+          apply_drift_loss=apply_drift_loss,
+          use_sai=use_sai,
+          sai_fft_len=sai_fft_len,
+          win_fast=win_fast,
+          win_slow=win_slow,
+          fs_int=fs_int,
+          num_samples=num_samples,
+          preroll_samples=preroll_samples,
+          lbfgs_memory_size=config.lbfgs_memory_size,
+        )
+      else:
+        u_curr, lbfgs_state, val = local_lbfgs_step(u_curr, lbfgs_state)
+      val_f = float(val)
+      loss_history.append(val_f)
+      if math.isfinite(val_f) and val_f < best_loss:
+        best_loss = val_f
+        best_w = u_curr * u_scale_j
+
+  return _project_wave(best_w, band_mask_j, num_samples), loss_history
+
+
 def invert_nap(
   target_nap: np.ndarray | jnp.ndarray,
   cochlea_model: cochlea.CochleaModel,
@@ -573,7 +1197,10 @@ def invert_nap(
   """Inverts a neural activity pattern (NAP) back to an audio waveform.
 
   Uses a physics-based DSP warm start followed by scale-invariant Adam + L-BFGS
-  optimization through the differentiable ``cochlea_model``.
+  optimization through the differentiable ``cochlea_model``. When input duration
+  exceeds ``config.chunk_seconds``, runs fixed-window overlap-add optimization
+  with frozen preceding-audio pre-roll so XLA compiles once and runtime scales
+  linearly with duration.
 
   Args:
     target_nap: Target NAP of shape ``(samples, channels)`` or
@@ -594,12 +1221,14 @@ def invert_nap(
   nap_3d, is_2d = _normalize_target_nap(target_nap, cochlea_model)
   t_len, n_ch, n_ears = nap_3d.shape
   fs = float(cochlea_model.sample_rate)
+  fs_int = int(round(fs))
 
   rest_len = min(512, t_len)
   rest_nap_j = jnp.asarray(
     cochlea_model(jnp.zeros((rest_len, n_ears), dtype=jnp.float32))[-1:],
     dtype=jnp.float32,
   )
+  rest_nap_np = np.asarray(rest_nap_j[0], dtype=np.float32)
   target_j = jnp.asarray(nap_3d, dtype=jnp.float32)
 
   if (
@@ -636,156 +1265,186 @@ def invert_nap(
   else:
     init_np = np.zeros((t_len, n_ears), dtype=np.float32)
 
-  band_mask_j = _audible_band_mask(t_len, fs, cochlea_model, cfg)
-
-  def project_wave(wave_2d: jnp.ndarray) -> jnp.ndarray:
-    spec = jnp.fft.rfft(wave_2d, axis=0) * band_mask_j
-    return jnp.fft.irfft(spec, n=t_len, axis=0).astype(jnp.float32)
-
-  nap_var = jnp.maximum(jnp.mean((target_j - rest_nap_j) ** 2), 1e-6)
-  win_fast = max(3, int(round(_ENVELOPE_FAST_S * fs)) | 1)
-  win_slow = max(5, int(round(_ENVELOPE_SLOW_S * fs)) | 1)
-  target_pos = jnp.maximum(target_j - rest_nap_j, 0.0)
-  target_env_f = _smooth_time_boxcar(target_pos, win_fast)
-  target_env_s = _smooth_time_boxcar(target_pos, win_slow)
-  env_var = jnp.maximum(jnp.mean(target_env_f**2), 1e-6)
+  is_pytree = not jax.tree_util.treedef_is_leaf(
+    jax.tree_util.tree_structure(cochlea_model)
+  )
+  fixed_cochlea = (
+    jax.tree_util.tree_map(jax.lax.stop_gradient, cochlea_model)
+    if is_pytree
+    else cochlea_model
+  )
 
   if isinstance(cochlea_model, carfac.CarfacCochleaModel):
     cfs = np.asarray(cochlea_model.channel_frequencies, dtype=np.float32)
     hf_mask_j = jnp.asarray((cfs >= 3500.0).astype(np.float32)[None, :, None])
   else:
     hf_mask_j = jnp.zeros((1, n_ch, 1), dtype=jnp.float32)
-  ch_rms = jnp.sqrt(jnp.mean(target_j**2, axis=(0, 2), keepdims=True))
-  ch_scale = jnp.maximum(ch_rms, 0.02)
 
-  sai_fft_len = min(2048, 2 ** int(math.floor(math.log2(t_len))))
-  use_sai = cfg.mode == "perceptual" and sai_fft_len >= 64
-  if use_sai:
-    sai_hypers = sai.SaiHypers(fft_len=sai_fft_len)
-    target_sai = jax.lax.stop_gradient(
-      sai.from_naps(jnp.transpose(target_j, (2, 0, 1)), sai_hypers)
+  win_fast = max(3, int(round(_ENVELOPE_FAST_S * fs)) | 1)
+  win_slow = max(5, int(round(_ENVELOPE_SLOW_S * fs)) | 1)
+
+  chunk_samples = (
+    int(round(cfg.chunk_seconds * fs))
+    if cfg.chunk_seconds is not None
+    else t_len
+  )
+  use_ola = cfg.chunk_seconds is not None and t_len > chunk_samples
+
+  if not use_ola:
+    band_mask_j = _audible_band_mask(t_len, fs, cochlea_model, cfg)
+    sai_fft_len = min(2048, 2 ** int(math.floor(math.log2(t_len))))
+    use_sai = cfg.mode == "perceptual" and sai_fft_len >= 64
+    empty_prefix = jnp.zeros((0, n_ears), dtype=jnp.float32)
+    final_w_2d, loss_history = _optimize_window(
+      init_np,
+      target_j,
+      empty_prefix,
+      rest_nap_j,
+      band_mask_j,
+      hf_mask_j,
+      fixed_cochlea,
+      cfg,
+      is_pytree=is_pytree,
+      fs_int=fs_int,
+      win_fast=win_fast,
+      win_slow=win_slow,
+      sai_fft_len=sai_fft_len,
+      use_sai=use_sai,
     )
-    sai_var = jnp.maximum(jnp.mean(target_sai**2), 1e-6)
   else:
-    sai_hypers = None
-    target_sai = None
-    sai_var = jnp.float32(1.0)
+    win_len = max(64, chunk_samples)
+    fade_len = min(int(round(cfg.chunk_overlap_s * fs)), win_len // 2)
+    hop = max(1, win_len - fade_len)
+    pre_roll = min(int(round(cfg.chunk_preroll_s * fs)), hop)
 
-  if jax.tree_util.treedef_is_leaf(jax.tree_util.tree_structure(cochlea_model)):
-    fixed_cochlea = cochlea_model
-  else:
-    fixed_cochlea = jax.tree_util.tree_map(jax.lax.stop_gradient, cochlea_model)
+    band_mask_j = _audible_band_mask(win_len, fs, cochlea_model, cfg)
+    sai_fft_len = min(2048, 2 ** int(math.floor(math.log2(win_len))))
+    use_sai = cfg.mode == "perceptual" and sai_fft_len >= 64
 
-  def loss_fn(wave_2d: jnp.ndarray) -> jnp.ndarray:
-    projected = project_wave(wave_2d)
-    pred = fixed_cochlea(projected)
-    if cfg.mode == "exact":
-      loss = jnp.mean((pred - target_j) ** 2) / nap_var
-      if cfg.hf_env_weight > 0.0:
-        pred_env = _smooth_time_boxcar(
-          jnp.maximum(pred - rest_nap_j, 0.0), win_fast
+    num_chunks = max(1, math.ceil(max(0, t_len - win_len) / hop) + 1)
+    padded_len = (num_chunks - 1) * hop + win_len
+
+    target_pad = np.broadcast_to(
+      rest_nap_np[None, :, :], (padded_len, n_ch, n_ears)
+    ).copy()
+    target_pad[:t_len] = nap_3d
+    init_pad = np.zeros((padded_len, n_ears), dtype=np.float32)
+    init_pad[:t_len] = init_np
+
+    if fade_len > 0:
+      ramp = (
+        np.sin(0.5 * math.pi * np.arange(fade_len, dtype=np.float32) / fade_len)
+        ** 2
+      )[:, None]
+    else:
+      ramp = np.zeros((0, 1), dtype=np.float32)
+
+    out_pad = np.zeros((padded_len, n_ears), dtype=np.float32)
+    loss_history = []
+    for chunk_idx in range(num_chunks):
+      start = chunk_idx * hop
+      end = start + win_len
+      if chunk_idx == 0 or pre_roll == 0:
+        prefix = jnp.zeros((pre_roll, n_ears), dtype=jnp.float32)
+      else:
+        prefix = jnp.asarray(
+          out_pad[start - pre_roll : start], dtype=jnp.float32
         )
-        hf_err = jnp.mean(
-          hf_mask_j * ((pred_env - target_env_f) / ch_scale) ** 2
-        )
-        loss = loss + cfg.hf_env_weight * hf_err
-      if cfg.cutoff_low_hz <= 0.0:
-        loss = loss + waveform_losses.low_frequency_drift_penalty(
-          projected, sample_rate=int(round(fs))
-        )
-      return loss
 
-    pred_pos = jnp.maximum(pred - rest_nap_j, 0.0)
-    pred_env_f = _smooth_time_boxcar(pred_pos, win_fast)
-    pred_env_s = _smooth_time_boxcar(pred_pos, win_slow)
-    env_loss = (
-      jnp.mean((pred_env_f - target_env_f) ** 2)
-      + jnp.mean((pred_env_s - target_env_s) ** 2)
-    ) / (2.0 * env_var)
-    nap_loss = jnp.mean((pred - target_j) ** 2) / nap_var
-    if use_sai and sai_hypers is not None and target_sai is not None:
-      pred_sai = sai.from_naps(jnp.transpose(pred, (2, 0, 1)), sai_hypers)
-      sai_loss = jnp.mean((pred_sai - target_sai) ** 2) / sai_var
-      return 0.65 * env_loss + 0.25 * sai_loss + 0.10 * nap_loss
-    return 0.85 * env_loss + 0.15 * nap_loss
-
-  current_w = project_wave(jnp.asarray(init_np, dtype=jnp.float32))
-  best_w = current_w
-  best_loss = float(jax.jit(loss_fn)(current_w))
-  loss_history: list[float] = []
-
-  if cfg.adam_steps > 0:
-    rms0 = max(float(jnp.sqrt(jnp.mean(current_w**2))), 1e-5)
-    schedule = optax.cosine_decay_schedule(
-      init_value=cfg.adam_lr_scale * rms0,
-      decay_steps=cfg.adam_steps,
-      alpha=0.05,
-    )
-    adam_opt = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(schedule))
-    adam_state = adam_opt.init(current_w)
-    adam_vg = jax.value_and_grad(loss_fn)
-
-    @jax.jit
-    def adam_step(
-      w: jnp.ndarray, state: optax.OptState
-    ) -> tuple[jnp.ndarray, optax.OptState, jnp.ndarray]:
-      val, grads = adam_vg(w)
-      updates, next_state = adam_opt.update(grads, state, w)
-      return project_wave(optax.apply_updates(w, updates)), next_state, val
-
-    for _ in range(cfg.adam_steps):
-      current_w, adam_state, val = adam_step(current_w, adam_state)
-      val_f = float(val)
-      loss_history.append(val_f)
-      if math.isfinite(val_f) and val_f < best_loss:
-        best_loss = val_f
-        best_w = current_w
-
-  if cfg.lbfgs_steps > 0:
-    # Normalize parameters to O(1) RMS so L-BFGS's identity Hessian matches scale.
-    u_rms = float(jnp.sqrt(jnp.mean(best_w**2)))
-    u_scale = 1e-2 if u_rms < 1e-8 else max(u_rms, 1e-5)
-    u_curr = best_w / u_scale
-
-    def loss_scaled(u: jnp.ndarray) -> jnp.ndarray:
-      return loss_fn(u * u_scale)
-
-    lbfgs_opt = optax.lbfgs(
-      learning_rate=1.0, memory_size=cfg.lbfgs_memory_size
-    )
-    lbfgs_state = lbfgs_opt.init(u_curr)
-    lbfgs_vg = jax.value_and_grad(loss_scaled)
-
-    @jax.jit
-    def lbfgs_step(
-      u: jnp.ndarray, state: optax.OptState
-    ) -> tuple[jnp.ndarray, optax.OptState, jnp.ndarray]:
-      val, grads = lbfgs_vg(u)
-      updates, next_state = lbfgs_opt.update(
-        grads, state, u, value=val, grad=grads, value_fn=loss_scaled
+      target_win = jnp.asarray(target_pad[start:end], dtype=jnp.float32)
+      init_win = init_pad[start:end]
+      win_w, win_hist = _optimize_window(
+        init_win,
+        target_win,
+        prefix,
+        rest_nap_j,
+        band_mask_j,
+        hf_mask_j,
+        fixed_cochlea,
+        cfg,
+        is_pytree=is_pytree,
+        fs_int=fs_int,
+        win_fast=win_fast,
+        win_slow=win_slow,
+        sai_fft_len=sai_fft_len,
+        use_sai=use_sai,
       )
-      return project_wave(optax.apply_updates(u, updates)), next_state, val
+      loss_history.extend(win_hist)
+      win_np = np.asarray(win_w, dtype=np.float32)
 
-    for _ in range(cfg.lbfgs_steps):
-      u_curr, lbfgs_state, val = lbfgs_step(u_curr, lbfgs_state)
-      val_f = float(val)
-      loss_history.append(val_f)
-      if math.isfinite(val_f) and val_f < best_loss:
-        best_loss = val_f
-        best_w = u_curr * u_scale
+      if fade_len > 0 and chunk_idx > 0:
+        out_pad[start : start + fade_len] = (
+          out_pad[start : start + fade_len] * (1.0 - ramp)
+          + win_np[:fade_len] * ramp
+        )
+        out_pad[start + fade_len : end] = win_np[fade_len:]
+      else:
+        out_pad[start:end] = win_np
 
-  final_w_2d = project_wave(best_w)
-  final_eval = float(jax.jit(loss_fn)(final_w_2d))
-  if math.isfinite(final_eval):
-    best_loss = min(best_loss, final_eval)
+    full_mask_j = _audible_band_mask(t_len, fs, cochlea_model, cfg)
+    final_w_2d = _project_wave(
+      jnp.asarray(out_pad[:t_len], dtype=jnp.float32), full_mask_j, t_len
+    )
 
   recon_3d = np.asarray(fixed_cochlea(final_w_2d), dtype=np.float32)
+  # Compute full-clip final loss against the blended output.
+  full_mask_j = _audible_band_mask(t_len, fs, cochlea_model, cfg)
+  full_sai_len = min(2048, 2 ** int(math.floor(math.log2(t_len))))
+  full_use_sai = cfg.mode == "perceptual" and full_sai_len >= 64
+  full_nap_var = jnp.maximum(jnp.mean((target_j - rest_nap_j) ** 2), 1e-6)
+  full_pos = jnp.maximum(target_j - rest_nap_j, 0.0)
+  full_env_f = _smooth_time_boxcar(full_pos, win_fast)
+  full_env_s = _smooth_time_boxcar(full_pos, win_slow)
+  full_env_var = jnp.maximum(jnp.mean(full_env_f**2), 1e-6)
+  full_ch_scale = jnp.maximum(
+    jnp.sqrt(jnp.mean(target_j**2, axis=(0, 2), keepdims=True)), 0.02
+  )
+  if full_use_sai:
+    full_sai_target = sai.from_naps(
+      jnp.transpose(target_j, (2, 0, 1)), sai.SaiHypers(fft_len=full_sai_len)
+    )
+    full_sai_var = jnp.maximum(jnp.mean(full_sai_target**2), 1e-6)
+  else:
+    full_sai_target = jnp.zeros((1, 1, 1, 1), dtype=jnp.float32)
+    full_sai_var = jnp.float32(1.0)
+
+  final_loss = float(
+    _window_loss_impl(
+      final_w_2d,
+      fixed_cochlea,
+      jnp.zeros((0, n_ears), dtype=jnp.float32),
+      target_j,
+      rest_nap_j,
+      full_mask_j,
+      full_env_f,
+      full_env_s,
+      full_sai_target,
+      hf_mask_j,
+      full_ch_scale,
+      full_nap_var,
+      full_env_var,
+      full_sai_var,
+      jnp.float32(cfg.hf_env_weight),
+      jnp.float32(cfg.perceptual_nap_weight),
+      mode=cfg.mode,
+      use_hf_env=cfg.hf_env_weight > 0.0,
+      apply_drift_loss=cfg.cutoff_low_hz <= 0.0,
+      use_sai=full_use_sai,
+      sai_fft_len=full_sai_len,
+      win_fast=win_fast,
+      win_slow=win_slow,
+      fs_int=fs_int,
+      num_samples=t_len,
+      preroll_samples=0,
+    )
+  )
+
   final_np = np.asarray(final_w_2d, dtype=np.float32)
   return NapInversionResult(
     waveform=final_np[:, 0] if is_2d else final_np,
     warm_start=init_np[:, 0] if is_2d else init_np,
     reconstructed_nap=recon_3d[:, :, 0] if is_2d else recon_3d,
     loss_history=tuple(loss_history),
-    final_loss=best_loss,
+    final_loss=final_loss,
     sample_rate_hz=fs,
   )

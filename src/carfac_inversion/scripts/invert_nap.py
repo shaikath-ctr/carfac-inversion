@@ -28,6 +28,7 @@ _FITTED_PROFILE_PATH: flags.FlagHolder[str | None]
 _MODE: flags.FlagHolder[str | None]
 _ADAM_STEPS: flags.FlagHolder[int]
 _LBFGS_STEPS: flags.FlagHolder[int]
+_CHUNK_SECONDS: flags.FlagHolder[float]
 
 
 def define_flags(flag_values: flags.FlagValues = FLAGS) -> None:
@@ -41,6 +42,7 @@ def define_flags(flag_values: flags.FlagValues = FLAGS) -> None:
   global _MODE
   global _ADAM_STEPS
   global _LBFGS_STEPS
+  global _CHUNK_SECONDS
 
   _INPUT_WAV = flags.DEFINE_string(
     "input_wav",
@@ -101,9 +103,12 @@ def define_flags(flag_values: flags.FlagValues = FLAGS) -> None:
     "Number of RMS-normalized L-BFGS refinement steps.",
     flag_values=flag_values,
   )
-
-
-define_flags()
+  _CHUNK_SECONDS = flags.DEFINE_float(
+    "chunk_seconds",
+    1.5,
+    "Fixed OLA window duration in seconds (<=0 disables OLA chunking).",
+    flag_values=flag_values,
+  )
 
 
 def run_invert_wav(
@@ -117,6 +122,7 @@ def run_invert_wav(
   mode: inversion.InversionMode | None = None,
   adam_steps: int = 80,
   lbfgs_steps: int = 100,
+  chunk_seconds: float | None = 1.5,
 ) -> inversion.NapInversionResult:
   """Loads a WAV file, passes it through source CARFAC, and inverts to WAV."""
   if fitted_profile_path is not None and source_ohc_health is not None:
@@ -165,6 +171,7 @@ def run_invert_wav(
     mode=resolved_mode,
     adam_steps=adam_steps,
     lbfgs_steps=lbfgs_steps,
+    chunk_seconds=chunk_seconds,
   )
   result = inversion.invert_nap(target_nap, target_cochlea, config)
   audio_io.save_audio_to_file(result.waveform, output_wav, sample_rate_hz)
@@ -202,6 +209,7 @@ def main(argv: Sequence[str]) -> None:
     resolved_mode = "exact"
   elif mode_val == "perceptual":
     resolved_mode = "perceptual"
+  chunk_s = _CHUNK_SECONDS.value if _CHUNK_SECONDS.value > 0.0 else None
   run_invert_wav(
     input_wav=_INPUT_WAV.value,
     output_wav=_OUTPUT_WAV.value,
@@ -212,8 +220,10 @@ def main(argv: Sequence[str]) -> None:
     mode=resolved_mode,
     adam_steps=_ADAM_STEPS.value,
     lbfgs_steps=_LBFGS_STEPS.value,
+    chunk_seconds=chunk_s,
   )
 
 
 if __name__ == "__main__":
+  define_flags()
   app.run(main)

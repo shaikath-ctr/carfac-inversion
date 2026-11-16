@@ -118,6 +118,18 @@ class CarfacInversionTest(parameterized.TestCase):
       inversion.InversionConfig(adam_lr_scale=0.0)
     with self.assertRaises(ValueError):
       inversion.InversionConfig(lbfgs_memory_size=0)
+    with self.assertRaises(ValueError):
+      inversion.InversionConfig(perceptual_nap_weight=-0.1)
+    with self.assertRaises(ValueError):
+      inversion.InversionConfig(perceptual_nap_weight=1.1)
+    with self.assertRaises(ValueError):
+      inversion.InversionConfig(chunk_seconds=0.0)
+    with self.assertRaises(ValueError):
+      inversion.InversionConfig(chunk_overlap_s=-0.1)
+    with self.assertRaises(ValueError):
+      inversion.InversionConfig(chunk_preroll_s=-0.1)
+    with self.assertRaises(ValueError):
+      inversion.InversionConfig(chunk_seconds=0.5, chunk_overlap_s=0.5)
 
   def test_target_nap_validation_rejects_bad_inputs(self):
     with self.assertRaisesRegex(ValueError, "2 dimensions"):
@@ -332,6 +344,54 @@ class CarfacInversionTest(parameterized.TestCase):
     self.assertEqual(result.waveform.shape, (512, 1))
     # Linear channel sum reconstructs 437.5 Hz tone to high accuracy inside band.
     np.testing.assert_allclose(result.waveform[:, 0], sig, rtol=1e-2, atol=5e-4)
+
+  def test_ola_chunked_matches_full_clip_quality(self):
+    sig = _make_speech_like_signal(
+      sample_rate_hz=self.sample_rate_hz, duration_s=1.0, level_db_spl=65.0
+    )
+    nap = np.asarray(self.healthy(jnp.asarray(sig[:, None]))[:, :, 0])
+
+    full_cfg = inversion.InversionConfig(
+      mode="exact", adam_steps=70, lbfgs_steps=70, chunk_seconds=None
+    )
+    ola_cfg = inversion.InversionConfig(
+      mode="exact",
+      adam_steps=70,
+      lbfgs_steps=70,
+      chunk_seconds=0.5,
+      chunk_overlap_s=0.1,
+      chunk_preroll_s=0.064,
+    )
+    res_full = inversion.invert_nap(nap, self.healthy, full_cfg)
+    res_ola = inversion.invert_nap(nap, self.healthy, ola_cfg)
+
+    self.assertEqual(res_ola.waveform.shape, sig.shape)
+    self.assertEqual(res_ola.reconstructed_nap.shape, nap.shape)
+
+    ctx_full = metric_context.Context(
+      reference=sig,
+      estimation=res_full.waveform,
+      sample_rate=self.sample_rate_hz,
+      hearing_loss_db=np.zeros(6),
+    )
+    ctx_ola = metric_context.Context(
+      reference=sig,
+      estimation=res_ola.waveform,
+      sample_rate=self.sample_rate_hz,
+      hearing_loss_db=np.zeros(6),
+    )
+    ola_nap_corr = float(
+      np.corrcoef(res_ola.reconstructed_nap.ravel(), nap.ravel())[0, 1]
+    )
+    self.assertGreater(ola_nap_corr, 0.99)
+    ola_stoi = perceptual.stoi(ctx_ola)
+    full_stoi = perceptual.stoi(ctx_full)
+    self.assertGreater(ola_stoi, 0.85)
+    self.assertGreater(ola_stoi, full_stoi - 0.01)
+    self.assertGreater(
+      waveform_metrics.si_sdr(ctx_ola),
+      waveform_metrics.si_sdr(ctx_full) - 1.5,
+    )
 
   def test_no_optimization_steps_returns_projected_warm_start(self):
     sig = _make_speech_like_signal(sample_rate_hz=16000, duration_s=0.1)
