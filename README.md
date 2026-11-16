@@ -35,10 +35,16 @@ envelopes.
      modes:
      - `mode="exact"`: Sample-level NAP MSE plus a >3.5 kHz envelope anchor for
        same-cochlea round-trip reconstruction.
-     - `mode="perceptual"`: Multi-scale NAP envelopes (2 ms and 8 ms) +
-       Stabilized Auditory Image (SAI) matching for cross-cochlea hearing-loss
-       auralization (inverting an impaired cochlea's NAP through a healthy
-       cochlea even when OHC loss alters traveling-wave group delays).
+     - `mode="perceptual"`: Multi-scale NAP envelopes (2 ms and 8 ms),
+       Stabilized Auditory Image (SAI) matching, plus an optional weak
+       sample-level `perceptual_nap_weight` anchor (default `0.10`) for
+       cross-cochlea hearing-loss auralization (inverting an impaired cochlea's
+       NAP through a healthy cochlea even when OHC loss alters traveling-wave
+       group delays).
+   - Automatically chunks utterances longer than `chunk_seconds` (default
+     `1.5 s`) with `chunk_overlap_s` (`0.128 s`) overlap-add blending and frozen
+     preceding-audio pre-roll (`chunk_preroll_s`, `0.064 s`) via module-level
+     JIT kernels so XLA compiles once and runtime scales linearly with duration.
 
 ## Installation
 
@@ -98,6 +104,17 @@ python -m carfac_inversion.scripts.invert_nap \
   --output_wav=auralized.wav \
   --source_ohc_health=0.5 \
   --level_db_spl=65.0
+```
+
+Diagnostic benchmark suite across sample rates (`16/32 kHz`), levels, SNRs,
+step budgets, and cross-cochlea auralization (supports raw WAV/FLAC directories,
+`ProcessedClips` shards, or optional LibriSpeech `dev-clean` preparation):
+
+```bash
+python -m carfac_inversion.scripts.benchmark_suite \
+  --input_dir=/path/to/wavs_or_shards \
+  --output_dir=tmp/carfac_inversion_benchmark \
+  --max_clips=3
 ```
 
 ## Development
