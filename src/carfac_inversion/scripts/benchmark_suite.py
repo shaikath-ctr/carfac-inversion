@@ -140,7 +140,7 @@ def define_flags(flag_values: flags.FlagValues = FLAGS) -> None:
   )
   _STEP_BUDGETS = flags.DEFINE_list(
     "step_budgets",
-    ["0+0", "40+40", "80+100"],
+    ["0+0", "20+60", "45+135"],
     "Comma-separated adam+lbfgs step budgets for the Pareto curve.",
     flag_values=flag_values,
   )
@@ -527,6 +527,7 @@ def _plot_summary_charts(
     ax.set_title("Step-Budget Pareto Curve (SI-SDR vs. Runtime)")
     ax.set_xlabel("Runtime per clip (s)")
     ax.set_ylabel("SI-SDR (dB)")
+    ax.margins(x=0.14, y=0.14)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(charts_dir / "pareto_quality_vs_runtime.png", dpi=200)
@@ -548,9 +549,9 @@ def _plot_summary_charts(
     ax.bar(x_pos - 0.18, env_means, width=0.35, label="Envelope corr")
     ax.bar(x_pos + 0.18, sai_means, width=0.35, label="SAI corr")
     ax.set_xticks(x_pos, labels, rotation=20, ha="right")
-    ax.set_ylim(0.0, 1.05)
+    ax.set_ylim(0.0, 1.15)
     ax.set_title("Cross-Cochlea Auralization Alignment")
-    ax.legend()
+    ax.legend(loc="upper right", ncol=2)
     ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
     fig.savefig(charts_dir / "auralization_comparison.png", dpi=200)
@@ -567,7 +568,7 @@ def run_benchmark(
   sample_rates: Sequence[int] = (16000,),
   levels_db_spl: Sequence[float] = (50.0, 65.0, 80.0),
   snrs_db: Sequence[float | None] = (None, 10.0, 0.0),
-  step_budgets: Sequence[tuple[int, int]] = ((0, 0), (40, 40), (80, 100)),
+  step_budgets: Sequence[tuple[int, int]] = ((0, 0), (20, 60), (45, 135)),
   enhancers: Sequence[str] = (),
   chunk_seconds: float | None = 1.5,
   seed: int = 0,

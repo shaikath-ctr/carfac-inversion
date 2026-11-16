@@ -21,18 +21,23 @@ envelopes.
    - Measures open-loop CARFAC basilar-membrane impulse responses through any
      configured conductive and middle-ear front-end filters at an AGC-damped
      operating Q (`ohc_scale`).
-   - Excludes apical channels below `min_warm_start_cf_hz` (default `250 Hz`)
-     during linear warm-start inversion so quadratic `ohc_nlf` combination-tone
-     distortion is not amplified into sub-bass rumble.
+   - Two-pass apical recovery: Pass 1 inverts channels at or above
+     `min_warm_start_cf_hz` (`250 Hz`) so quadratic `ohc_nlf` combination-tone
+     distortion is excluded from initial phase recovery; Pass 2 subtracts the
+     orthogonalized Pass-1 closed-loop CARFAC response to recover unexplained
+     `< 250 Hz` low-frequency drive without amplifying combination-tone
+     artifacts.
    - Compensates discrete-time IHC + synapse `lpf_coeff` phase lag and rolloff
      below `hf_crossover_hz` (`4200 Hz`), extracts high-pass-cleaned envelopes
      modulated onto bandlimited noise above `hf_crossover_hz`, and calibrates
      per-channel RMS SPL plus 1-shot spectral tilt equalization.
 2. **Scale-Invariant JAX Optimization (`invert_nap`)**:
    - Projects iterates onto the audible band `[cutoff_low_hz, cutoff_high_hz]`
-     in rFFT space to prevent sub-audible drift and Nyquist ringing.
-   - Optimizes via cosine-decayed Adam followed by RMS-normalized L-BFGS in two
-     modes:
+     (default low edge `35 Hz` with an `18 Hz` cosine taper) in rFFT space to
+     preserve speech fundamentals while rejecting sub-audible DC drift.
+   - Optimizes via cosine-decayed Adam (`adam_steps=45`) followed by
+     exact-secant RMS-normalized L-BFGS (`lbfgs_steps=135`,
+     `lbfgs_memory_size=25`) in two modes:
      - `mode="exact"`: Sample-level NAP MSE plus a >3.5 kHz envelope anchor for
        same-cochlea round-trip reconstruction.
      - `mode="perceptual"`: Multi-scale NAP envelopes (2 ms and 8 ms),

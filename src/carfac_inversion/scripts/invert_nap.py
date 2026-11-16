@@ -93,13 +93,13 @@ def define_flags(flag_values: flags.FlagValues = FLAGS) -> None:
   )
   _ADAM_STEPS = flags.DEFINE_integer(
     "adam_steps",
-    80,
+    45,
     "Number of initial Adam optimization steps.",
     flag_values=flag_values,
   )
   _LBFGS_STEPS = flags.DEFINE_integer(
     "lbfgs_steps",
-    100,
+    135,
     "Number of RMS-normalized L-BFGS refinement steps.",
     flag_values=flag_values,
   )
@@ -120,8 +120,8 @@ def run_invert_wav(
   source_ohc_health: float | None = None,
   fitted_profile_path: str | None = None,
   mode: inversion.InversionMode | None = None,
-  adam_steps: int = 80,
-  lbfgs_steps: int = 100,
+  adam_steps: int = 45,
+  lbfgs_steps: int = 135,
   chunk_seconds: float | None = 1.5,
 ) -> inversion.NapInversionResult:
   """Loads a WAV file, passes it through source CARFAC, and inverts to WAV."""

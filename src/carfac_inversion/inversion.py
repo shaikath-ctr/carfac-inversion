@@ -84,17 +84,17 @@ class InversionConfig:
   """
 
   mode: InversionMode = "exact"
-  adam_steps: int = 80
-  lbfgs_steps: int = 100
+  adam_steps: int = 45
+  lbfgs_steps: int = 135
   use_warm_start: bool = True
   min_warm_start_cf_hz: float = 250.0
   hf_crossover_hz: float = 4200.0
-  cutoff_low_hz: float = 60.0
+  cutoff_low_hz: float = 35.0
   cutoff_high_hz: float | None = None
   hf_env_weight: float = 0.005
   perceptual_nap_weight: float = 0.10
   adam_lr_scale: float = 0.08
-  lbfgs_memory_size: int = 15
+  lbfgs_memory_size: int = 25
   chunk_seconds: float | None = 1.5
   chunk_overlap_s: float = 0.128
   chunk_preroll_s: float = 0.064
@@ -389,8 +389,13 @@ def _carfac_dsp_warm_start(
   )
 
   rng = np.random.default_rng(config.seed)
-  x_ears = np.zeros((t_len, n_ears), dtype=np.float64)
+  x_mid = np.zeros((t_len, n_ears), dtype=np.float64)
+  h_ears: list[np.ndarray] = []
+  lpf_invs: list[np.ndarray] = []
+  dens: list[np.ndarray] = []
+  med_dens: list[float] = []
 
+  # Pass 1: invert supra-apical channels (>= min_warm_start_cf_hz).
   for ear in range(n_ears):
     h_ear = np.fft.rfft(bm_irs[:, :, ear], n=n_fft, axis=0)
     lpf_inv = _ihc_lpf_inverse(cochlea_model, freqs, ear, fs)
@@ -428,38 +433,137 @@ def _carfac_dsp_warm_start(
       freqs <= min(0.48 * fs, float(cfs[0]) * 1.15)
     )
     reg = np.where(passband, 0.02 * med_den, 1e6 * med_den)
-    x_ears[:, ear] = np.fft.irfft(num / (den + reg), n=n_fft)[:t_len]
+    x_mid[:, ear] = np.fft.irfft(num / (den + reg), n=n_fft)[:t_len]
+    h_ears.append(h_ear)
+    lpf_invs.append(lpf_inv)
+    dens.append(den)
+    med_dens.append(med_den)
 
-  norm_rms = float(np.sqrt(np.mean(x_ears**2)))
-  if norm_rms < 1e-12:
-    return np.zeros((t_len, n_ears), dtype=np.float32)
-
-  x_unit = jnp.asarray(x_ears / norm_rms, dtype=jnp.float32)
+  norm_rms = float(np.sqrt(np.mean(x_mid**2)))
   target_c_j = jnp.asarray(nap_c, dtype=jnp.float32)
   rest_j = jnp.asarray(rest_nap[None, :, :], dtype=jnp.float32)
-  best_gain = _calibrate_scalar_gain(x_unit, target_c_j, rest_j, cochlea_model)
-  x1 = x_ears * (best_gain / norm_rms)
-
-  # Apply 1-shot nonlinear spectral tilt equalization via one forward pass.
-  nap1 = (
-    np.asarray(
-      cochlea_model(jnp.asarray(x1, dtype=jnp.float32)), dtype=np.float64
+  if norm_rms >= 1e-8:
+    x_unit = jnp.asarray(x_mid / norm_rms, dtype=jnp.float32)
+    best_gain = _calibrate_scalar_gain(
+      x_unit, target_c_j, rest_j, cochlea_model
     )
-    - rest_nap[None, :, :]
-  )
+    x1 = x_mid * (best_gain / norm_rms)
+    nap1 = (
+      np.asarray(
+        cochlea_model(jnp.asarray(x1, dtype=jnp.float32)), dtype=np.float64
+      )
+      - rest_nap[None, :, :]
+    )
+    mid_gain_scale = best_gain / norm_rms
+  else:
+    x1 = np.zeros((t_len, n_ears), dtype=np.float64)
+    nap1 = np.zeros_like(nap_c)
+    mid_gain_scale = 1.0
+
+  # Pass 2: recover apical (< min_warm_start_cf_hz) drive from orthogonalized
+  # closed-loop residual so quadratic ohc_nlf combination tones cancel even
+  # when Pass 1 amplitude or phase differs slightly across sample rates.
+  apical_floor = max(45.0, config.cutoff_low_hz)
+  ap_chs = np.where(
+    (cfs >= apical_floor) & (cfs < config.min_warm_start_cf_hz)
+  )[0]
+  x_comb = x1.copy()
+  has_apical = [False] * n_ears
+  added_any_apical = False
+
+  if len(ap_chs) > 0:
+    for ear in range(n_ears):
+      tgt_ap = nap_c[:, ap_chs, ear]
+      leak_ap = nap1[:, ap_chs, ear]
+      dot_ap = np.sum(tgt_ap * leak_ap, axis=0)
+      leak_pow = np.sum(leak_ap**2, axis=0) + 1e-12
+      beta_ap = np.clip(dot_ap / leak_pow, 0.0, 1.5)
+      orth_res = tgt_ap - beta_ap[None, :] * leak_ap
+
+      rms_tgt_ap = float(np.sqrt(np.mean(tgt_ap**2))) + 1e-12
+      rms_orth_ap = float(np.sqrt(np.mean(orth_res**2)))
+      unexplained_frac = (
+        1.0
+        if norm_rms < 1e-8
+        else float(np.clip((rms_orth_ap / rms_tgt_ap - 0.65) / 0.25, 0.0, 1.0))
+      )
+      if unexplained_frac <= 0.0:
+        continue
+      h_ear = h_ears[ear]
+      lpf_inv = lpf_invs[ear]
+      den = dens[ear]
+      med_den = med_dens[ear]
+      bm_ap = np.zeros_like(h_ear)
+      for idx, ch in enumerate(ap_chs):
+        cf = cfs[ch]
+        f_lo = max(apical_floor * 0.85, cf * 0.72)
+        f_hi = min(
+          config.min_warm_start_cf_hz * 1.15, max(f_lo + 25.0, cf * 1.38)
+        )
+        ch_mask = ((freqs >= f_lo) & (freqs <= f_hi)).astype(np.float64)
+        ch_tgt_r = float(np.sqrt(np.mean(tgt_ap[:, idx] ** 2))) + 1e-9
+        ch_orth_r = float(np.sqrt(np.mean(orth_res[:, idx] ** 2)))
+        ch_gate = (
+          1.0
+          if norm_rms < 1e-8
+          else float(np.clip((ch_orth_r / ch_tgt_r - 0.55) / 0.35, 0.0, 1.0))
+        )
+        bm_ap[:, ch] = (
+          np.fft.rfft(orth_res[:, idx], n=n_fft) * lpf_inv * ch_mask * ch_gate
+        )
+      num_ap = np.sum(np.conj(h_ear) * bm_ap, axis=1)
+      reg_ap = np.maximum(0.04 * den, 0.001 * med_den)
+      pass_ap = (freqs >= apical_floor * 0.85) & (
+        freqs <= config.min_warm_start_cf_hz * 1.2
+      )
+      x_ap = np.fft.irfft(
+        np.where(pass_ap, num_ap / (den + reg_ap), 0.0), n=n_fft
+      )[:t_len]
+      x_comb[:, ear] += unexplained_frac * x_ap * mid_gain_scale
+      has_apical[ear] = unexplained_frac >= 0.3
+      added_any_apical = True
+
+  comb_rms = float(np.sqrt(np.mean(x_comb**2)))
+  if comb_rms < 1e-12:
+    return np.zeros((t_len, n_ears), dtype=np.float32)
+
+  if norm_rms < 1e-8:
+    comb_gain = _calibrate_scalar_gain(
+      jnp.asarray(x_comb / comb_rms, dtype=jnp.float32),
+      target_c_j,
+      rest_j,
+      cochlea_model,
+    )
+    x_comb = x_comb * (comb_gain / comb_rms)
+
+  # Apply 1-shot nonlinear spectral tilt equalization via closed-loop CARFAC.
+  if added_any_apical or norm_rms < 1e-8:
+    nap_eq = (
+      np.asarray(
+        cochlea_model(jnp.asarray(x_comb, dtype=jnp.float32)), dtype=np.float64
+      )
+      - rest_nap[None, :, :]
+    )
+  else:
+    nap_eq = nap1
   order = np.argsort(cfs)
   f_w = np.fft.rfftfreq(t_len, d=1.0 / fs)
-  x2 = np.zeros_like(x1)
+  x2 = np.zeros_like(x_comb)
   for ear in range(n_ears):
     rms_tgt = np.sqrt(np.mean(np.maximum(nap_c[:, :, ear], 0.0) ** 2, axis=0))
-    rms_1 = np.sqrt(np.mean(np.maximum(nap1[:, :, ear], 0.0) ** 2, axis=0))
-    ratio = np.clip((rms_tgt + 2e-3) / (rms_1 + 2e-3), 0.3, 3.5)
+    rms_cur = np.sqrt(np.mean(np.maximum(nap_eq[:, :, ear], 0.0) ** 2, axis=0))
+    ratio = np.clip((rms_tgt + 2e-3) / (rms_cur + 2e-3), 0.3, 3.5)
     eq_curve = (
       np.interp(f_w, cfs[order], ratio[order], left=1.0, right=ratio[order][-1])
       ** 0.8
     )
-    eq_curve = np.where(f_w < config.min_warm_start_cf_hz * 0.8, 0.0, eq_curve)
-    x2[:, ear] = np.fft.irfft(np.fft.rfft(x1[:, ear]) * eq_curve, n=t_len)
+    low_cut = (
+      apical_floor * 0.85
+      if has_apical[ear]
+      else config.min_warm_start_cf_hz * 0.8
+    )
+    eq_curve = np.where(f_w < low_cut, 0.0, eq_curve)
+    x2[:, ear] = np.fft.irfft(np.fft.rfft(x_comb[:, ear]) * eq_curve, n=t_len)
 
   x2_rms = float(np.sqrt(np.mean(x2**2)))
   if x2_rms < 1e-12:
@@ -593,7 +697,7 @@ def _audible_band_mask(
     f_hi = 0.48 * sample_rate_hz
 
   f_lo = min(config.cutoff_low_hz, 0.5 * f_hi)
-  f_lo_end = min(f_lo + 35.0, 0.8 * f_hi)
+  f_lo_end = min(f_lo + 18.0, 0.8 * f_hi)
   f_hi_start = max(f_lo_end, f_hi * 0.9)
 
   mask = np.ones_like(freqs, dtype=np.float32)
@@ -921,9 +1025,8 @@ def _lbfgs_window_step_jit(
   updates, next_state = lbfgs_opt.update(
     grads, lbfgs_state, u_curr, value=val, grad=grads, value_fn=loss_scaled
   )
-  next_u = _project_wave(
-    optax.apply_updates(u_curr, updates), band_mask_j, num_samples
-  )
+  # Preserve exact L-BFGS secant updates; loss_scaled already projects inputs.
+  next_u = optax.apply_updates(u_curr, updates)
   return next_u, next_state, val
 
 
@@ -1136,9 +1239,7 @@ def _optimize_window(
           grads, state, u, value=val, grad=grads, value_fn=local_scaled
         )
         return (
-          _project_wave(
-            optax.apply_updates(u, updates), band_mask_j, num_samples
-          ),
+          optax.apply_updates(u, updates),
           next_state,
           val,
         )

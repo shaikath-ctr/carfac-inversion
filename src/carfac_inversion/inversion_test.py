@@ -393,6 +393,40 @@ class CarfacInversionTest(parameterized.TestCase):
       waveform_metrics.si_sdr(ctx_full) - 1.5,
     )
 
+  def test_apical_low_frequency_reconstruction(self):
+    fs = self.sample_rate_hz
+    t = np.arange(int(0.4 * fs), dtype=np.float64) / fs
+    sig = 0.7 * np.sin(2.0 * np.pi * 75.0 * t) + 0.3 * np.sin(
+      2.0 * np.pi * 440.0 * t
+    )
+    ramp = max(1, int(0.01 * fs))
+    taper = np.sin(0.5 * np.pi * np.arange(ramp) / ramp) ** 2
+    sig[:ramp] *= taper
+    sig[-ramp:] *= taper[::-1]
+    sig *= (10.0 ** ((55.0 - 104.0) / 20.0)) / (
+      np.sqrt(np.mean(sig**2)) + 1e-12
+    )
+    sig_f32 = sig.astype(np.float32)
+
+    nap = np.asarray(self.healthy(jnp.asarray(sig_f32[:, None]))[:, :, 0])
+    cfg = inversion.InversionConfig(mode="exact", adam_steps=20, lbfgs_steps=60)
+    res = inversion.invert_nap(nap, self.healthy, cfg)
+
+    freqs = np.fft.rfftfreq(len(sig_f32), d=1.0 / fs)
+    lf_mask = (freqs >= 55.0) & (freqs <= 200.0)
+    ref_lf = np.fft.irfft(np.fft.rfft(sig_f32) * lf_mask, n=len(sig_f32))
+    est_lf = np.fft.irfft(np.fft.rfft(res.waveform) * lf_mask, n=len(sig_f32))
+    lf_corr = float(np.corrcoef(ref_lf, est_lf)[0, 1])
+    self.assertGreater(lf_corr, 0.90)
+
+    ctx = metric_context.Context(
+      reference=sig_f32,
+      estimation=res.waveform,
+      sample_rate=fs,
+      hearing_loss_db=np.zeros(6),
+    )
+    self.assertGreater(waveform_metrics.si_sdr(ctx), 8.0)
+
   def test_no_optimization_steps_returns_projected_warm_start(self):
     sig = _make_speech_like_signal(sample_rate_hz=16000, duration_s=0.1)
     nap = np.asarray(self.healthy(jnp.asarray(sig[:, None]))[:, :, 0])
