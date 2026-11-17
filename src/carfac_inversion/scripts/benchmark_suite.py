@@ -714,16 +714,16 @@ def run_benchmark(
           )
           ablation_cfgs: list[tuple[str, inversion.InversionMode, float]] = [
             (
-              f"{coch_tag}_{sig_tag}_perc010",
+              f"{coch_tag}_{sig_tag}_perc030",
               "perceptual",
-              0.10,
+              0.30,
             ),
           ]
           if sig_tag == "noisy" and coch_tag == "ohc05":
             ablation_cfgs.extend(
               [
                 (f"{coch_tag}_{sig_tag}_perc000", "perceptual", 0.0),
-                (f"{coch_tag}_{sig_tag}_exact", "exact", 0.10),
+                (f"{coch_tag}_{sig_tag}_exact", "exact", 0.30),
               ]
             )
           for lbl, mode_val, nap_w in ablation_cfgs:

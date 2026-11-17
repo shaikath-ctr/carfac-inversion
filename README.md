@@ -38,11 +38,12 @@ envelopes.
    - Optimizes via cosine-decayed Adam (`adam_steps=45`) followed by
      exact-secant RMS-normalized L-BFGS (`lbfgs_steps=135`,
      `lbfgs_memory_size=25`) in two modes:
-     - `mode="exact"`: Sample-level NAP MSE plus a >3.5 kHz envelope anchor for
-       same-cochlea round-trip reconstruction.
-     - `mode="perceptual"`: Multi-scale NAP envelopes (2 ms and 8 ms),
-       Stabilized Auditory Image (SAI) matching, plus an optional weak
-       sample-level `perceptual_nap_weight` anchor (default `0.10`) for
+     - `mode="exact"`: Sample-level NAP MSE plus an HF-channel-normalized
+       `>3.5 kHz` envelope anchor (`hf_env_weight=0.008`) for same-cochlea
+       round-trip reconstruction.
+     - `mode="perceptual"`: Blended global and channel-normalized multi-scale
+       NAP envelopes (2 ms and 8 ms), Stabilized Auditory Image (SAI) matching,
+       and a sample-level `perceptual_nap_weight` anchor (default `0.30`) for
        cross-cochlea hearing-loss auralization (inverting an impaired cochlea's
        NAP through a healthy cochlea even when OHC loss alters traveling-wave
        group delays).
@@ -121,6 +122,13 @@ python -m carfac_inversion.scripts.benchmark_suite \
   --output_dir=tmp/carfac_inversion_benchmark \
   --max_clips=3
 ```
+
+## Evaluation
+
+See [docs/evaluation_phases.md](docs/evaluation_phases.md) for the complete
+phased ablation and benchmark log (Phase 0 initial DSP + optimization,
+Phase 1 OLA chunking & real-speech baseline, and Phase 2 apical/L-BFGS/HF/perceptual
+refinements).
 
 ## Development
 

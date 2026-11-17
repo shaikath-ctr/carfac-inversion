@@ -91,8 +91,8 @@ class InversionConfig:
   hf_crossover_hz: float = 4200.0
   cutoff_low_hz: float = 35.0
   cutoff_high_hz: float | None = None
-  hf_env_weight: float = 0.005
-  perceptual_nap_weight: float = 0.10
+  hf_env_weight: float = 0.008
+  perceptual_nap_weight: float = 0.30
   adam_lr_scale: float = 0.08
   lbfgs_memory_size: int = 25
   chunk_seconds: float | None = 1.5
@@ -772,7 +772,16 @@ def _window_loss_impl(
       pred_env = _smooth_time_boxcar(
         jnp.maximum(pred - rest_nap_j, 0.0), win_fast
       )
-      hf_err = jnp.mean(hf_mask_j * ((pred_env - target_env_f) / ch_scale) ** 2)
+      hf_denom = (
+        jnp.maximum(jnp.sum(hf_mask_j), 1.0)
+        * float(pred.shape[0])
+        * float(pred.shape[2])
+      )
+      hf_scale = jnp.maximum(ch_scale, 0.04)
+      hf_err = (
+        jnp.sum(hf_mask_j * ((pred_env - target_env_f) / hf_scale) ** 2)
+        / hf_denom
+      )
       loss = loss + hf_env_weight * hf_err
     if apply_drift_loss:
       loss = loss + waveform_losses.low_frequency_drift_penalty(
@@ -783,10 +792,17 @@ def _window_loss_impl(
   pred_pos = jnp.maximum(pred - rest_nap_j, 0.0)
   pred_env_f = _smooth_time_boxcar(pred_pos, win_fast)
   pred_env_s = _smooth_time_boxcar(pred_pos, win_slow)
-  env_loss = (
+  # Blend global envelope MSE with per-channel normalized MSE so 1-4 kHz
+  # speech bands stay weighted under high-frequency hearing loss.
+  global_env_loss = (
     jnp.mean((pred_env_f - target_env_f) ** 2)
     + jnp.mean((pred_env_s - target_env_s) ** 2)
   ) / (2.0 * env_var)
+  ch_env_loss = 0.5 * (
+    jnp.mean(((pred_env_f - target_env_f) / ch_scale) ** 2)
+    + jnp.mean(((pred_env_s - target_env_s) / ch_scale) ** 2)
+  )
+  env_loss = 0.70 * global_env_loss + 0.30 * ch_env_loss
   nap_loss = jnp.mean((pred - target_j) ** 2) / nap_var
   if use_sai:
     sai_hypers = sai.SaiHypers(fft_len=sai_fft_len)
