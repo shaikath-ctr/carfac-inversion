@@ -31,15 +31,29 @@ envelopes.
      below `hf_crossover_hz` (`4200 Hz`), extracts high-pass-cleaned envelopes
      modulated onto bandlimited noise above `hf_crossover_hz`, and calibrates
      per-channel RMS SPL plus 1-shot spectral tilt equalization.
-2. **Optional Dual-Domain Neural Residual Refiner (`neural.py`, Phase 3)**:
-   - When `InversionConfig.neural_checkpoint` is set, runs a lightweight
-     `1.3M`-parameter Flax ConvNeXt STFT + sample-rate 1D U-Net refiner
+2. **Optional Dual-Domain Neural Residual Refiner (`neural.py`, [`train_neural_refiner.py`](src/carfac_inversion/scripts/train_neural_refiner.py))**:
+   - When `InversionConfig.neural_checkpoint` is set, runs a `1.3M`-parameter
+     (`1,297,790` params) Flax ConvNeXt STFT + sample-rate 1D U-Net refiner
      (`NapResidualRefiner`) conditioned on canonical log-CF (`40–7200 Hz`)
-     target NAPs, warm-start NAP residuals, and physical SPL statistics.
+     target NAPs, (`target_nap - ws_nap`) residual statistics, and physical
+     SPL (`log10(ws_rms)`).
+   - Zero-initialized synthesis heads predict a global SPL multiplier
+     (`exp(delta_g)`), complex STFT ratio mask + additive complex STFT
+     residual (`n_fft=256, hop=64`), and a sample-aligned 1D U-Net tail
+     (`unet_base_dim=24`), initialized at exact identity (`max |out - x_ws| < 1e-6`,
+     exact `0.0` on silence).
    - Recovers high-SPL (`>= 80 dB SPL`) AGC compression and synthesizes
      `>4 kHz` harmonic/fricative fine structure in a single feedforward pass
      (`~15 ms/s` neural forward, `~3 s/clip` total at `0+0` vs `~111 s` L-BFGS),
-     optionally followed by a brief L-BFGS polish (e.g. `adam_steps=0, lbfgs_steps=15`).
+     optionally followed by a brief L-BFGS polish (`0+15`).
+   - Trained in two stages on speaker-disjoint LibriSpeech `dev-clean` (`32`
+     train speakers / `766` windows spanning `43–86 dB SPL` + clean/noisy;
+     `4` val speakers / `64` windows; `4` test speakers): Stage 1 (`1400` steps)
+     optimizes re-balanced multi-resolution STFT (`2048/1024/512/128`),
+     `3.8–7.8 kHz` HF log-magnitude MSE, RMS-normalized L1, `log_rms`,
+     `-SI-SDR`, and `<20 Hz` drift (`val_sisdr -3.41 -> +12.06 dB`); Stage 2
+     (`350` steps) adds differentiable CARFAC NAP + `>3.5 kHz` envelope cycle
+     consistency (`carfac_nap` val MSE `0.0950 -> 0.0711`).
 3. **Scale-Invariant JAX Optimization (`invert_nap`)**:
    - Projects iterates onto the audible band `[cutoff_low_hz, cutoff_high_hz]`
      (default low edge `35 Hz` with an `18 Hz` cosine taper) in rFFT space to
@@ -132,7 +146,7 @@ python -m carfac_inversion.scripts.benchmark_suite \
   --max_clips=3
 ```
 
-Fast single-pass or hybrid Phase 3 neural reconstruction & training:
+Fast single-pass or hybrid neural reconstruction & training:
 
 ```bash
 # Train 2-stage (spectral/waveform + differentiable CARFAC cycle) refiner:
@@ -150,33 +164,81 @@ python -m carfac_inversion.scripts.invert_nap \
   --adam_steps=0 --lbfgs_steps=15
 ```
 
-## Evaluation
+## Approach & Phased Evaluation Methodology
 
-Headline metrics on **4 held-out LibriSpeech speakers** (`[7850, 7976, 8297, 8842]`, `16 kHz`, `1.0 s` windows; 100% unseen during Phase 3 training):
+Every architectural improvement was driven by real-speech diagnostics in
+[`benchmark_suite.py`](src/carfac_inversion/scripts/benchmark_suite.py) and
+recorded with accepted/rejected ablations in
+[`docs/evaluation_phases.md`](docs/evaluation_phases.md):
+
+- **Phase 0 (`95e7a51`)**: Core open-loop CARFAC DSP warm start + rFFT-masked
+  Adam/L-BFGS passed **17 / 17** synthetic unit tests, surfacing two gaps:
+  unchunked XLA re-compilation on variable utterance lengths and no real-speech
+  multi-SPL benchmark.
+- **Phase 1 (`08d7700`, `a7b4025`)**: Added fixed-window OLA chunking
+  (**22 / 22** tests) and built `benchmark_suite.py`. Real-speech evaluation
+  exposed 4 concrete bottlenecks: `-2.5` to `-6.6 dB` SI-SDR on low-F0 speech
+  (`long_test.wav`), suboptimal `40+40` secants, `80 dB` AGC compression +
+  `> 4 kHz` sag, and `< 250 Hz` energy swamping `1–4 kHz` consonants in
+  `mode="perceptual"`.
+- **Phase 2a (`9970fa4`)**: Rejected naive unconditional `< 250 Hz` inversion
+  (`binaural_test` regressed across all SPLs) and inverse-threshold frequency
+  preconditioning `W_pre(f)` (`binaural_test` dropped `-4` to `-6 dB`). Even raw
+  Pass-2 residual subtraction failed our `32 kHz` unit test (`9.68 dB < 10.0 dB`)
+  until diagonal projection diagnosed `99.9%` of `< 250 Hz` NAP energy on that
+  synthetic clip was quadratic combination-tone leakage; orthogonalizing Pass-1
+  leakage fixed `32 kHz` (**23 / 23** tests) and lifted `long_test` by
+  **`+12.6` to `+14.3 dB` SI-SDR**.
+- **Phase 2b (`114cfc3`)**: Fixed an ~8x channel-averaging dilution bug in
+  `hf_err`, switched `mode="perceptual"` to blended channel-normalized envelopes
+  + `perceptual_nap_weight=0.30` (after testing and rejecting Pass-2 HF noise
+  injection, all-channel `log1p` anchors, L-BFGS curvature resets,
+  `adam_lr_scale` boosts, and `SaiPndLoss`).
+- **Phase 3 (`70d15b8`)**: Trained and benchmarked `NapResidualRefiner` against
+  L-BFGS optimization on both `carfac/test_data` and 4 completely unseen
+  LibriSpeech `dev-clean` speakers (**28 / 28** tests), re-balancing
+  `hp_acoustic`'s default `sqrt(win_len/2)` STFT loss scaling after an initial
+  smoke check showed `stft=112.7` drowning `SI-SDR` and CARFAC cycle consistency.
+
+## What the Metrics Mean
+
+| Metric | Domain & Range | What It Measures & How to Interpret It |
+| :--- | :--- | :--- |
+| **`SI-SDR`** | Waveform (dB) | **Scale-Invariant Signal-to-Distortion Ratio**: Sample-level carrier phase and waveform accuracy up to a global scalar. High `SI-SDR` (`> 10–20 dB`) indicates accurate `< 2–4 kHz` phase locking. *(In cross-cochlea `mode="perceptual"`, output reflects a healthy ear at impaired cochlear firing levels with different traveling-wave delays, so negative `SI-SDR` is expected and uninformative there.)* |
+| **`SNR`** | Waveform (dB) | **Signal-to-Noise Ratio**: Penalizes global SPL/volume mismatches directly (`ws/ref != 1.0`), making it essential at `80 dB SPL` where linear warm starts under-predict level due to OHC AGC compression. |
+| **`STOI`** | Perceptual (`0–1`) | **Short-Time Objective Intelligibility**: Correlates temporal amplitude envelopes across ~1/3-octave critical bands (`> 0.90` = high intelligibility); robust to `> 4 kHz` random-carrier phase ambiguity. |
+| **`HASPI v2`** | Auditory (`0–1`) | **Hearing-Aid Speech Perception Index**: Auditory-nerve intelligibility model calibrated to an audiogram (`1.0` = ceiling intelligibility). |
+| **`HASQI v2` (`nl` / `lin`)** | Auditory (`0–1`) | **Hearing-Aid Speech Quality Index (`HASQI = nl * lin`)**: Separates **`HASQI_lin`** (long-term spectral tilt) from **`HASQI_nl`** (cepstral spectral-envelope smoothness + temporal modulation); sensitive to `4.2–7.5 kHz` fricative naturalness and tonal harmonics vs. noise. |
+| **`NAP corr` / `Env corr` / `SAI corr`** | Cochlear (`-1` to `1`) | **Forward Manifold Consistency**: Passes reconstructed audio back through the target cochlea (`carfac`) to verify exact neural firing alignment (`NAP corr`), `200 Hz`-smoothed temporal envelopes (`Env corr`, phase-tolerant), and Stabilized Auditory Images (`SAI corr`, pitch/timbre periodicity)—the primary ground truth for cross-cochlea auralization. |
+| **Band SNRs (`60–300` … `4k5–7k5 Hz`)** | Spectral-Time (dB) | **Frequency Diagnostics**: `60–300 Hz` catches missing `< 250 Hz` pitch fundamentals (`F0`); `300–2200 Hz` tracks vowel formants & `80 dB` compression recovery; `4500–7500 Hz` isolates `> 4 kHz` synthesis above CARFAC's ~2 kHz IHC LPF. |
+
+## Evaluation Results
+
+Headline metrics on **4 held-out LibriSpeech speakers** (`[7850, 7976, 8297, 8842]`, `16 kHz`, `1.0 s` windows; 100% unseen during neural training):
 
 | Condition | Method | Runtime | SI-SDR | STOI | HASPI | HASQI / nl | 4.5–7.5 kHz SNR |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| `50 dB` clean | Phase 2 Warm Start (`0+0`) | `2.08 s` | `3.15 dB` | `0.8337` | `0.9997` | `0.508 / 0.624` | `0.0 dB` |
-| `50 dB` clean | Phase 2 L-BFGS (`20+60`) | `53.37 s` | `16.45 dB` | `0.9784` | `0.9997` | `0.733 / 0.768` | `-4.8 dB` |
-| `50 dB` clean | **Phase 3 Neural (`0+0`)** | **`3.07 s`** | `19.78 dB` | `0.9907` | `0.9999` | `0.791 / 0.834` | `-1.5 dB` |
-| `50 dB` clean | **Phase 3 Hybrid (`0+15`)** | `15.09 s` | **`20.03 dB`** | **`0.9961`** | **`1.0000`** | **`0.842 / 0.881`** | `-1.5 dB` |
-| `65 dB` clean | Phase 2 Warm Start (`0+0`) | `2.17 s` | `-3.49 dB` | `0.8033` | `0.9964` | `0.360 / 0.465` | `0.0 dB` |
-| `65 dB` clean | Phase 2 L-BFGS (`20+60`) | `51.97 s` | `8.08 dB` | `0.9255` | `0.9967` | `0.483 / 0.527` | `-4.4 dB` |
-| `65 dB` clean | **Phase 3 Neural (`0+0`)** | **`3.60 s`** | `17.38 dB` | `0.9865` | `0.9996` | `0.714 / 0.754` | `-1.0 dB` |
-| `65 dB` clean | **Phase 3 Hybrid (`0+15`)** | `14.24 s` | **`18.37 dB`** | **`0.9918`** | **`0.9999`** | **`0.779 / 0.817`** | **`-0.9 dB`** |
-| `80 dB` clean | Phase 2 Warm Start (`0+0`) | `2.14 s` | `-4.80 dB` | `0.6837` | `0.5757` | `0.127 / 0.162` | `-1.4 dB` |
-| `80 dB` clean | Phase 2 L-BFGS (`20+60`) | `50.98 s` | `0.37 dB` | `0.7993` | `0.8013` | `0.220 / 0.272` | `-4.3 dB` |
-| `80 dB` clean | **Phase 3 Neural (`0+0`)** | **`3.17 s`** | `12.83 dB` | `0.9464` | `0.9993` | `0.551 / 0.584` | `-1.3 dB` |
-| `80 dB` clean | **Phase 3 Hybrid (`0+15`)** | `13.36 s` | **`13.07 dB`** | **`0.9536`** | **`0.9996`** | **`0.609 / 0.644`** | **`-1.2 dB`** |
-| `65 dB`, 10 dB SNR | Phase 2 L-BFGS (`20+60`) | `51.70 s` | `7.17 dB` | `0.9296` | `0.9999` | `0.605 / 0.666` | `-0.1 dB` |
-| `65 dB`, 10 dB SNR | **Phase 3 Neural (`0+0`)** | **`3.06 s`** | `10.15 dB` | `0.9570` | `0.9999` | `0.620 / 0.651` | `-1.6 dB` |
-| `65 dB`, 10 dB SNR | **Phase 3 Hybrid (`0+15`)** | `14.21 s` | **`10.51 dB`** | **`0.9761`** | **`0.9999`** | **`0.647 / 0.675`** | `-1.6 dB` |
+| `50 dB` clean | DSP Warm Start (`0+0`) | `2.08 s` | `3.15 dB` | `0.8337` | `0.9997` | `0.508 / 0.624` | `0.0 dB` |
+| `50 dB` clean | DSP + L-BFGS (`20+60`) | `53.37 s` | `16.45 dB` | `0.9784` | `0.9997` | `0.733 / 0.768` | `-4.8 dB` |
+| `50 dB` clean | **DSP + Neural (`0+0`)** | **`3.07 s`** | `19.78 dB` | `0.9907` | `0.9999` | `0.791 / 0.834` | `-1.5 dB` |
+| `50 dB` clean | **DSP + Neural + L-BFGS (`0+15`)** | `15.09 s` | **`20.03 dB`** | **`0.9961`** | **`1.0000`** | **`0.842 / 0.881`** | `-1.5 dB` |
+| `65 dB` clean | DSP Warm Start (`0+0`) | `2.17 s` | `-3.49 dB` | `0.8033` | `0.9964` | `0.360 / 0.465` | `0.0 dB` |
+| `65 dB` clean | DSP + L-BFGS (`20+60`) | `51.97 s` | `8.08 dB` | `0.9255` | `0.9967` | `0.483 / 0.527` | `-4.4 dB` |
+| `65 dB` clean | **DSP + Neural (`0+0`)** | **`3.60 s`** | `17.38 dB` | `0.9865` | `0.9996` | `0.714 / 0.754` | `-1.0 dB` |
+| `65 dB` clean | **DSP + Neural + L-BFGS (`0+15`)** | `14.24 s` | **`18.37 dB`** | **`0.9918`** | **`0.9999`** | **`0.779 / 0.817`** | **`-0.9 dB`** |
+| `80 dB` clean | DSP Warm Start (`0+0`) | `2.14 s` | `-4.80 dB` | `0.6837` | `0.5757` | `0.127 / 0.162` | `-1.4 dB` |
+| `80 dB` clean | DSP + L-BFGS (`20+60`) | `50.98 s` | `0.37 dB` | `0.7993` | `0.8013` | `0.220 / 0.272` | `-4.3 dB` |
+| `80 dB` clean | **DSP + Neural (`0+0`)** | **`3.17 s`** | `12.83 dB` | `0.9464` | `0.9993` | `0.551 / 0.584` | `-1.3 dB` |
+| `80 dB` clean | **DSP + Neural + L-BFGS (`0+15`)** | `13.36 s` | **`13.07 dB`** | **`0.9536`** | **`0.9996`** | **`0.609 / 0.644`** | **`-1.2 dB`** |
+| `65 dB`, 10 dB SNR | DSP + L-BFGS (`20+60`) | `51.70 s` | `7.17 dB` | `0.9296` | `0.9999` | `0.605 / 0.666` | `-0.1 dB` |
+| `65 dB`, 10 dB SNR | **DSP + Neural (`0+0`)** | **`3.06 s`** | `10.15 dB` | `0.9570` | `0.9999` | `0.620 / 0.651` | `-1.6 dB` |
+| `65 dB`, 10 dB SNR | **DSP + Neural + L-BFGS (`0+15`)** | `14.21 s` | **`10.51 dB`** | **`0.9761`** | **`0.9999`** | **`0.647 / 0.675`** | `-1.6 dB` |
 
-Highlights on canonical out-of-domain `carfac/test_data` (`binaural_test.wav` & `long_test.wav`):
-- **Round-trip (`mode="exact"`, Phase 2 `45+135` at `~111 s` -> Phase 3 Hybrid `0+15` at `~14 s`)**: `binaural_test` reached `SI-SDR 15.85 dB / STOI 0.9850` at `50 dB`, `STOI 0.9180 -> 0.9786` / `HASQI 0.479 -> 0.512` at `65 dB`, and `HASPI 0.8863 -> 0.9945` / `STOI 0.8219 -> 0.8857` / `HASQI 0.232 -> 0.284` at `80 dB`; `long_test` improved from `9.56 -> 13.57 dB` at `65 dB` and `7.70 -> 11.65 dB` at `80 dB`.
-- **Cross-cochlea auralization (`mode="perceptual"`, Phase 2 `perc030`)**: On `sloping` hearing loss (`65 dB`, 10 dB noisy), achieved `NAP corr 0.8721 / 0.9598`, `Env corr 0.9545 / 0.9874`, `SAI corr 0.9741 / 0.9908`, `HASPI 0.9938 / 0.9522`, and `STOI 0.9233 / 0.7282` (`binaural_test` / `long_test`). *(Note: the Phase 3 checkpoint targets same-cochlea `mode="exact"` reconstruction; cross-cochlea `mode="perceptual"` should use Phase 2 `perc030`.)*
+Highlights on canonical out-of-domain `carfac/test_data` (`binaural_test.wav` & `long_test.wav`) & scope boundaries:
+- **Round-trip (`mode="exact"`, DSP + `45+135` L-BFGS @ `~111 s` -> DSP + Neural + `0+15` L-BFGS @ `~14 s`)**: `binaural_test` reached `SI-SDR 15.85 dB / STOI 0.9850` at `50 dB`, `STOI 0.9180 -> 0.9786` / `HASQI 0.479 -> 0.512` at `65 dB`, and `STOI 0.8219 -> 0.8857` / `HASPI 0.8863 -> 0.9945` / `HASQI 0.232 -> 0.284` at `80 dB` (`ws/ref 0.216 -> p3/ref 0.837`); `long_test` improved from `9.56 -> 13.57 dB` at `65 dB` and `7.70 -> 11.65 dB` at `80 dB`.
+- **Cross-cochlea auralization (`mode="perceptual"`, `perc030`)**: On `sloping` hearing loss (`65 dB`, 10 dB noisy), achieved `NAP corr 0.8721 / 0.9598`, `Env corr 0.9545 / 0.9874`, `SAI corr 0.9741 / 0.9908`, `HASPI 0.9938 / 0.9522`, and `STOI 0.9233 / 0.7282` (`binaural_test` / `long_test`). *(Scope caveat: the trained neural checkpoint targets same-cochlea `mode="exact"` reconstruction; passing impaired NAPs pulls output back toward healthy speech rather than staying on the impaired cochlear manifold (`nap_corr 0.29–0.62` vs. `perc030` `0.67–0.96`), so cross-cochlea auralization should use `mode="perceptual"` without the `exact`-trained checkpoint until a dedicated cross-cochlea checkpoint is trained.)*
 
-See [docs/evaluation_phases.md](docs/evaluation_phases.md) for the full Phase 0–3 ablation log, accepted/rejected hypotheses, training details, and per-clip tables (`28 / 28` pytest tests passing).
+See [`docs/evaluation_phases.md`](docs/evaluation_phases.md) for the complete Phase 0–3 ablation log, accepted/rejected hypotheses, training details, and per-clip tables (`28 / 28` pytest tests passing across `inversion_test.py` (16), `neural_test.py` (5), `benchmark_suite_test.py` (4), and `invert_nap_test.py` (3)).
 
 ## Development
 
