@@ -25,6 +25,8 @@ from hp_acoustic.models import carfac
 from hp_acoustic.models import cochlea
 from hp_acoustic.models import sai
 
+from carfac_inversion import neural
+
 logger = logging.getLogger(__name__)
 
 InversionMode = Literal["exact", "perceptual"]
@@ -80,6 +82,10 @@ class InversionConfig:
     chunk_preroll_s: Frozen preceding-audio context in seconds prepended to
       each chunk so CARFAC traveling-wave and AGC states are warmed up before
       scoring the chunk window.
+    neural_checkpoint: Optional path to a trained Phase 3 ``.npz``
+      :class:`carfac_inversion.neural.NapResidualRefiner` checkpoint. When set,
+      refines the DSP warm start in one feedforward pass before gradient
+      optimization.
     seed: Random seed for high-frequency warm-start noise carriers.
   """
 
@@ -98,6 +104,7 @@ class InversionConfig:
   chunk_seconds: float | None = 1.5
   chunk_overlap_s: float = 0.128
   chunk_preroll_s: float = 0.064
+  neural_checkpoint: str | None = None
   seed: int = 0
 
   def __post_init__(self) -> None:
@@ -1381,6 +1388,16 @@ def invert_nap(
     init_np = np.asarray(init_3d, dtype=np.float32)
   else:
     init_np = np.zeros((t_len, n_ears), dtype=np.float32)
+
+  if initial_waveform is None and cfg.neural_checkpoint is not None:
+    init_np = neural.refine_waveform(
+      nap_3d,
+      init_np,
+      cochlea_model,
+      cfg.neural_checkpoint,
+      chunk_seconds=cfg.chunk_seconds,
+      chunk_overlap_s=cfg.chunk_overlap_s,
+    )
 
   is_pytree = not jax.tree_util.treedef_is_leaf(
     jax.tree_util.tree_structure(cochlea_model)

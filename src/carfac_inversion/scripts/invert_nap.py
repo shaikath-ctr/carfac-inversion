@@ -29,6 +29,7 @@ _MODE: flags.FlagHolder[str | None]
 _ADAM_STEPS: flags.FlagHolder[int]
 _LBFGS_STEPS: flags.FlagHolder[int]
 _CHUNK_SECONDS: flags.FlagHolder[float]
+_NEURAL_CHECKPOINT: flags.FlagHolder[str | None]
 
 
 def define_flags(flag_values: flags.FlagValues = FLAGS) -> None:
@@ -43,6 +44,7 @@ def define_flags(flag_values: flags.FlagValues = FLAGS) -> None:
   global _ADAM_STEPS
   global _LBFGS_STEPS
   global _CHUNK_SECONDS
+  global _NEURAL_CHECKPOINT
 
   _INPUT_WAV = flags.DEFINE_string(
     "input_wav",
@@ -109,6 +111,12 @@ def define_flags(flag_values: flags.FlagValues = FLAGS) -> None:
     "Fixed OLA window duration in seconds (<=0 disables OLA chunking).",
     flag_values=flag_values,
   )
+  _NEURAL_CHECKPOINT = flags.DEFINE_string(
+    "neural_checkpoint",
+    None,
+    "Optional path to a trained Phase 3 neural residual refiner .npz.",
+    flag_values=flag_values,
+  )
 
 
 def run_invert_wav(
@@ -123,6 +131,7 @@ def run_invert_wav(
   adam_steps: int = 45,
   lbfgs_steps: int = 135,
   chunk_seconds: float | None = 1.5,
+  neural_checkpoint: str | None = None,
 ) -> inversion.NapInversionResult:
   """Loads a WAV file, passes it through source CARFAC, and inverts to WAV."""
   if fitted_profile_path is not None and source_ohc_health is not None:
@@ -172,6 +181,7 @@ def run_invert_wav(
     adam_steps=adam_steps,
     lbfgs_steps=lbfgs_steps,
     chunk_seconds=chunk_seconds,
+    neural_checkpoint=neural_checkpoint,
   )
   result = inversion.invert_nap(target_nap, target_cochlea, config)
   audio_io.save_audio_to_file(result.waveform, output_wav, sample_rate_hz)
@@ -221,6 +231,7 @@ def main(argv: Sequence[str]) -> None:
     adam_steps=_ADAM_STEPS.value,
     lbfgs_steps=_LBFGS_STEPS.value,
     chunk_seconds=chunk_s,
+    neural_checkpoint=_NEURAL_CHECKPOINT.value,
   )
 
 

@@ -64,6 +64,7 @@ _ENHANCERS: flags.FlagHolder[list[str]]
 _CHUNK_SECONDS: flags.FlagHolder[float]
 _SEED: flags.FlagHolder[int]
 _PREPARE_LIBRISPEECH_ARCHIVE: flags.FlagHolder[str | None]
+_NEURAL_CHECKPOINT: flags.FlagHolder[str | None]
 
 _BANDS_HZ: tuple[tuple[int, int], ...] = (
   (60, 300),
@@ -89,6 +90,7 @@ def define_flags(flag_values: flags.FlagValues = FLAGS) -> None:
   global _CHUNK_SECONDS
   global _SEED
   global _PREPARE_LIBRISPEECH_ARCHIVE
+  global _NEURAL_CHECKPOINT
 
   _INPUT_DIR = flags.DEFINE_string(
     "input_dir",
@@ -167,6 +169,12 @@ def define_flags(flag_values: flags.FlagValues = FLAGS) -> None:
     None,
     "Optional OpenSLR archive name (e.g. 'dev-clean') to prepare into "
     "--input_dir before running the benchmark.",
+    flag_values=flag_values,
+  )
+  _NEURAL_CHECKPOINT = flags.DEFINE_string(
+    "neural_checkpoint",
+    None,
+    "Optional path to a trained Phase 3 neural residual refiner .npz.",
     flag_values=flag_values,
   )
 
@@ -571,6 +579,7 @@ def run_benchmark(
   step_budgets: Sequence[tuple[int, int]] = ((0, 0), (20, 60), (45, 135)),
   enhancers: Sequence[str] = (),
   chunk_seconds: float | None = 1.5,
+  neural_checkpoint: str | None = None,
   seed: int = 0,
 ) -> list[dict[str, Any]]:
   """Executes the full real-speech round-trip, Pareto, and auralization suite."""
@@ -619,6 +628,7 @@ def run_benchmark(
             adam_steps=default_adam,
             lbfgs_steps=default_lbfgs,
             chunk_seconds=chunk_seconds,
+            neural_checkpoint=neural_checkpoint,
             seed=seed,
           )
           t0 = time.perf_counter()
@@ -660,6 +670,7 @@ def run_benchmark(
           adam_steps=adam_s,
           lbfgs_steps=lbfgs_s,
           chunk_seconds=chunk_seconds,
+          neural_checkpoint=neural_checkpoint,
           seed=seed,
         )
         t0 = time.perf_counter()
@@ -733,6 +744,7 @@ def run_benchmark(
               adam_steps=default_adam,
               lbfgs_steps=default_lbfgs,
               chunk_seconds=chunk_seconds,
+              neural_checkpoint=neural_checkpoint,
               seed=seed,
             )
             t0 = time.perf_counter()
@@ -813,6 +825,7 @@ def main(argv: Sequence[str]) -> None:
     step_budgets=budgets,
     enhancers=_ENHANCERS.value,
     chunk_seconds=chunk_s,
+    neural_checkpoint=_NEURAL_CHECKPOINT.value,
     seed=_SEED.value,
   )
   print(f"Wrote {len(rows)} benchmark rows to {_OUTPUT_DIR.value}/metrics.csv")

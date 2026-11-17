@@ -15,7 +15,7 @@ nerve synapse modeling (`syn_step`). Below ~2–4 kHz, NAPs preserve fine tempor
 phase-locking; above ~4 kHz, carrier phase is attenuated into positive temporal
 envelopes.
 
-`carfac-inversion` solves the inverse `NAP -> audio` problem in two stages:
+`carfac-inversion` solves the inverse `NAP -> audio` problem in up to three stages:
 
 1. **Physics-Based CARFAC DSP Warm Start (`dsp_warm_start`)**:
    - Measures open-loop CARFAC basilar-membrane impulse responses through any
@@ -31,7 +31,16 @@ envelopes.
      below `hf_crossover_hz` (`4200 Hz`), extracts high-pass-cleaned envelopes
      modulated onto bandlimited noise above `hf_crossover_hz`, and calibrates
      per-channel RMS SPL plus 1-shot spectral tilt equalization.
-2. **Scale-Invariant JAX Optimization (`invert_nap`)**:
+2. **Optional Dual-Domain Neural Residual Refiner (`neural.py`, Phase 3)**:
+   - When `InversionConfig.neural_checkpoint` is set, runs a lightweight
+     `1.3M`-parameter Flax ConvNeXt STFT + sample-rate 1D U-Net refiner
+     (`NapResidualRefiner`) conditioned on canonical log-CF (`40–7200 Hz`)
+     target NAPs, warm-start NAP residuals, and physical SPL statistics.
+   - Recovers high-SPL (`>= 80 dB SPL`) AGC compression and synthesizes
+     `>4 kHz` harmonic/fricative fine structure in a single feedforward pass
+     (`~15 ms/s` neural forward, `~3 s/clip` total at `0+0` vs `~111 s` L-BFGS),
+     optionally followed by a brief L-BFGS polish (e.g. `adam_steps=0, lbfgs_steps=15`).
+3. **Scale-Invariant JAX Optimization (`invert_nap`)**:
    - Projects iterates onto the audible band `[cutoff_low_hz, cutoff_high_hz]`
      (default low edge `35 Hz` with an `18 Hz` cosine taper) in rFFT space to
      preserve speech fundamentals while rejecting sub-audible DC drift.
@@ -123,12 +132,30 @@ python -m carfac_inversion.scripts.benchmark_suite \
   --max_clips=3
 ```
 
+Fast single-pass or hybrid Phase 3 neural reconstruction & training:
+
+```bash
+# Train 2-stage (spectral/waveform + differentiable CARFAC cycle) refiner:
+python -m carfac_inversion.scripts.train_neural_refiner \
+  --train_cache=/path/to/train_cache.npz \
+  --val_cache=/path/to/val_cache.npz \
+  --output_checkpoint=tmp/phase3_refiner.npz
+
+# Invert in ~3 s/clip (0+0 feedforward) or ~14 s/clip (0+15 L-BFGS polish):
+python -m carfac_inversion.scripts.invert_nap \
+  --input_wav=input.wav \
+  --output_wav=roundtrip_p3.wav \
+  --level_db_spl=80.0 \
+  --neural_checkpoint=tmp/phase3_refiner.npz \
+  --adam_steps=0 --lbfgs_steps=15
+```
+
 ## Evaluation
 
 See [docs/evaluation_phases.md](docs/evaluation_phases.md) for the complete
 phased ablation and benchmark log (Phase 0 initial DSP + optimization,
-Phase 1 OLA chunking & real-speech baseline, and Phase 2 apical/L-BFGS/HF/perceptual
-refinements).
+Phase 1 OLA chunking & real-speech baseline, Phase 2 apical/L-BFGS/HF/perceptual
+refinements, and Phase 3 neural residual refiner + LibriSpeech held-out evaluation).
 
 ## Development
 
