@@ -161,6 +161,8 @@ python -m carfac_inversion.scripts.train_neural_refiner \
   --output_checkpoint=tmp/phase3_refiner.npz
 
 # Invert in ~3 s/clip (0+0 feedforward) or ~14 s/clip (0+15 L-BFGS polish):
+# (Download pre-trained 4.6 MiB `phase3_refiner.npz` from a GitHub Release asset
+# when published, or produce it via `train_neural_refiner.py` above.)
 python -m carfac_inversion.scripts.invert_nap \
   --input_wav=input.wav \
   --output_wav=roundtrip_p3.wav \
@@ -204,6 +206,14 @@ recorded with accepted/rejected ablations in
   LibriSpeech `dev-clean` speakers (**28 / 28** tests), re-balancing
   `hp_acoustic`'s default `sqrt(win_len/2)` STFT loss scaling after an initial
   smoke check showed `stft=112.7` drowning `SI-SDR` and CARFAC cycle consistency.
+- **Calibration Alignment & Retuned CARFAC Robustness (`f571baa`, `9da7cbf`)**:
+  Aligned SPL scaling in `benchmark_suite.py` and `invert_nap.py` with
+  `sii.CARFAC_RMS_ONE_DB_SPL` (`RMS = 1.0 ≈ 107.01 dB SPL`, `0 dBFS` sine peak
+  `= 104 dB SPL`), added dynamic gain bounds + `1e-7` Adam/L-BFGS RMS floors
+  for retuned high-gain CARFAC presets (reducing Option C `20 dB` warm-start
+  gain error from `5.3x` to `1.01x`), scaled open-loop BM `ir_len` up to `8192`
+  at `48 kHz`, and moved `ohc_scale` per ear after ablations showed per-channel
+  `ohc_scale` hurt Phase 3 (`-1.7` to `-3.7 dB` SI-SDR). (**31 / 31** tests.)
 
 ## What the Metrics Mean
 
@@ -219,29 +229,29 @@ recorded with accepted/rejected ablations in
 
 ## Evaluation Results
 
-Headline metrics on **4 held-out LibriSpeech speakers** (`[7850, 7976, 8297, 8842]`, `16 kHz`, `1.0 s` windows; 100% unseen during neural training):
+Headline metrics on **4 held-out LibriSpeech speakers** (`[7850, 7976, 8297, 8842]`, `16 kHz`, `1.0 s` windows; 100% unseen during neural training, calibrated under `sii.CARFAC_RMS_ONE_DB_SPL ≈ 107.01 dB SPL`):
 
 | Condition | Method | Runtime | SI-SDR | STOI | HASPI | HASQI / nl | 4.5–7.5 kHz SNR |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| `50 dB` clean | DSP Warm Start (`0+0`) | `2.08 s` | `3.15 dB` | `0.8337` | `0.9997` | `0.508 / 0.624` | `0.0 dB` |
-| `50 dB` clean | DSP + L-BFGS (`20+60`) | `53.37 s` | `16.45 dB` | `0.9784` | `0.9997` | `0.733 / 0.768` | `-4.8 dB` |
-| `50 dB` clean | **DSP + Neural (`0+0`)** | **`3.07 s`** | `19.78 dB` | `0.9907` | `0.9999` | `0.791 / 0.834` | `-1.5 dB` |
-| `50 dB` clean | **DSP + Neural + L-BFGS (`0+15`)** | `15.09 s` | **`20.03 dB`** | **`0.9961`** | **`1.0000`** | **`0.842 / 0.881`** | `-1.5 dB` |
-| `65 dB` clean | DSP Warm Start (`0+0`) | `2.17 s` | `-3.49 dB` | `0.8033` | `0.9964` | `0.360 / 0.465` | `0.0 dB` |
-| `65 dB` clean | DSP + L-BFGS (`20+60`) | `51.97 s` | `8.08 dB` | `0.9255` | `0.9967` | `0.483 / 0.527` | `-4.4 dB` |
-| `65 dB` clean | **DSP + Neural (`0+0`)** | **`3.60 s`** | `17.38 dB` | `0.9865` | `0.9996` | `0.714 / 0.754` | `-1.0 dB` |
-| `65 dB` clean | **DSP + Neural + L-BFGS (`0+15`)** | `14.24 s` | **`18.37 dB`** | **`0.9918`** | **`0.9999`** | **`0.779 / 0.817`** | **`-0.9 dB`** |
-| `80 dB` clean | DSP Warm Start (`0+0`) | `2.14 s` | `-4.80 dB` | `0.6837` | `0.5757` | `0.127 / 0.162` | `-1.4 dB` |
-| `80 dB` clean | DSP + L-BFGS (`20+60`) | `50.98 s` | `0.37 dB` | `0.7993` | `0.8013` | `0.220 / 0.272` | `-4.3 dB` |
-| `80 dB` clean | **DSP + Neural (`0+0`)** | **`3.17 s`** | `12.83 dB` | `0.9464` | `0.9993` | `0.551 / 0.584` | `-1.3 dB` |
-| `80 dB` clean | **DSP + Neural + L-BFGS (`0+15`)** | `13.36 s` | **`13.07 dB`** | **`0.9536`** | **`0.9996`** | **`0.609 / 0.644`** | **`-1.2 dB`** |
-| `65 dB`, 10 dB SNR | DSP + L-BFGS (`20+60`) | `51.70 s` | `7.17 dB` | `0.9296` | `0.9999` | `0.605 / 0.666` | `-0.1 dB` |
-| `65 dB`, 10 dB SNR | **DSP + Neural (`0+0`)** | **`3.06 s`** | `10.15 dB` | `0.9570` | `0.9999` | `0.620 / 0.651` | `-1.6 dB` |
-| `65 dB`, 10 dB SNR | **DSP + Neural + L-BFGS (`0+15`)** | `14.21 s` | **`10.51 dB`** | **`0.9761`** | **`0.9999`** | **`0.647 / 0.675`** | `-1.6 dB` |
+| `50 dB` clean | DSP Warm Start (`0+0`) | `3.36 s` | `4.10 dB` | `0.8394` | `0.9998` | `0.538 / 0.644` | `0.0 dB` |
+| `50 dB` clean | DSP + L-BFGS (`20+60`) | `53.79 s` | `16.34 dB` | `0.9822` | `0.9999` | `0.789 / 0.822` | `-4.8 dB` |
+| `50 dB` clean | **DSP + Neural (`0+0`)** | **`3.08 s`** | `19.39 dB` | `0.9881` | `0.9999` | `0.815 / 0.858` | `-1.6 dB` |
+| `50 dB` clean | **DSP + Neural + L-BFGS (`0+15`)** | `15.89 s` | **`19.44 dB`** | **`0.9943`** | **`1.0000`** | **`0.860 / 0.898`** | `-1.6 dB` |
+| `65 dB` clean | DSP Warm Start (`0+0`) | `2.17 s` | `-2.64 dB` | `0.8119` | `0.9983` | `0.404 / 0.520` | `0.0 dB` |
+| `65 dB` clean | DSP + L-BFGS (`20+60`) | `51.53 s` | `10.69 dB` | `0.9346` | `0.9988` | `0.535 / 0.569` | `-4.7 dB` |
+| `65 dB` clean | **DSP + Neural (`0+0`)** | **`3.21 s`** | `17.80 dB` | `0.9887` | `0.9996` | `0.721 / 0.761` | `-1.0 dB` |
+| `65 dB` clean | **DSP + Neural + L-BFGS (`0+15`)** | `14.68 s` | **`18.88 dB`** | **`0.9935`** | **`0.9999`** | **`0.785 / 0.822`** | **`-1.0 dB`** |
+| `80 dB` clean | DSP Warm Start (`0+0`) | `2.30 s` | `-4.58 dB` | `0.7132` | `0.7036` | `0.168 / 0.215` | `-0.8 dB` |
+| `80 dB` clean | DSP + L-BFGS (`20+60`) | `51.22 s` | `1.72 dB` | `0.8294` | `0.8682` | `0.273 / 0.331` | `-3.6 dB` |
+| `80 dB` clean | **DSP + Neural (`0+0`)** | **`3.33 s`** | `14.08 dB` | `0.9564` | `0.9995` | `0.598 / 0.632` | `-1.2 dB` |
+| `80 dB` clean | **DSP + Neural + L-BFGS (`0+15`)** | `13.59 s` | **`14.42 dB`** | **`0.9629`** | **`0.9997`** | **`0.662 / 0.697`** | **`-1.1 dB`** |
+| `65 dB`, 10 dB SNR | DSP + L-BFGS (`20+60`) | `51.72 s` | `8.97 dB` | `0.9450` | `1.0000` | `0.644 / 0.695` | `-0.1 dB` |
+| `65 dB`, 10 dB SNR | **DSP + Neural (`0+0`)** | **`3.28 s`** | `10.33 dB` | `0.9675` | `0.9999` | `0.695 / 0.729` | `-1.7 dB` |
+| `65 dB`, 10 dB SNR | **DSP + Neural + L-BFGS (`0+15`)** | `14.58 s` | **`10.73 dB`** | **`0.9844`** | **`1.0000`** | **`0.725 / 0.755`** | `-1.7 dB` |
 
 Highlights on canonical out-of-domain `carfac/test_data` (`binaural_test.wav` & `long_test.wav`) & scope boundaries:
-- **Round-trip (`mode="exact"`, DSP + `45+135` L-BFGS @ `~111 s` -> DSP + Neural + `0+15` L-BFGS @ `~14 s`)**: `binaural_test` reached `SI-SDR 15.85 dB / STOI 0.9850` at `50 dB`, `STOI 0.9180 -> 0.9786` / `HASQI 0.479 -> 0.512` at `65 dB`, and `STOI 0.8219 -> 0.8857` / `HASPI 0.8863 -> 0.9945` / `HASQI 0.232 -> 0.284` at `80 dB` (`ws/ref 0.216 -> p3/ref 0.837`); `long_test` improved from `9.56 -> 13.57 dB` at `65 dB` and `7.70 -> 11.65 dB` at `80 dB`.
-- **Cross-cochlea auralization (`mode="perceptual"`, `perc030`)**: On `sloping` hearing loss (`65 dB`, 10 dB noisy), achieved `NAP corr 0.8721 / 0.9598`, `Env corr 0.9545 / 0.9874`, `SAI corr 0.9741 / 0.9908`, `HASPI 0.9938 / 0.9522`, and `STOI 0.9233 / 0.7282` (`binaural_test` / `long_test`). *(Scope caveat: the trained neural checkpoint targets same-cochlea `mode="exact"` reconstruction; passing impaired NAPs pulls output back toward healthy speech rather than staying on the impaired cochlear manifold (`nap_corr 0.29–0.62` vs. `perc030` `0.67–0.96`), so cross-cochlea auralization should use `mode="perceptual"` without the `exact`-trained checkpoint until a dedicated cross-cochlea checkpoint is trained.)*
+- **Round-trip (`mode="exact"`, DSP + `45+135` L-BFGS @ `~110 s` -> DSP + Neural + `0+15` L-BFGS @ `~14–26 s`)**: `binaural_test` reached `SI-SDR 16.80 dB / STOI 0.9864` at `50 dB`, `SI-SDR 9.26 -> 9.44 dB` / `STOI 0.9204 -> 0.9843` at `65 dB`, and `STOI 0.8471 -> 0.9049` / `HASPI 0.9989 -> 0.9986` / `SI-SDR 1.38 -> 1.06 dB` at `80 dB` (`ws/ref 0.247 -> p3/ref 0.860`); `long_test` improved from `10.47 -> 13.59 dB` (`13.91 dB` at `0+0`) at `65 dB` and `8.53 -> 12.11 dB` at `80 dB`.
+- **Cross-cochlea auralization (`mode="perceptual"`, `perc030`)**: On `sloping` hearing loss (`65 dB`, 10 dB noisy), achieved `NAP corr 0.8724 / 0.9622`, `Env corr 0.9571 / 0.9874`, `SAI corr 0.9710 / 0.9901`, `HASPI 0.9841 / 0.8904`, and `STOI 0.9351 / 0.7441` (`binaural_test` / `long_test`). *(Scope caveat: the trained neural checkpoint targets same-cochlea `mode="exact"` reconstruction; passing impaired NAPs pulls output back toward healthy speech rather than staying on the impaired cochlear manifold (`nap_corr 0.33–0.49` vs. `perc030` `0.67–0.96`), so cross-cochlea auralization should use `mode="perceptual"` without the `exact`-trained checkpoint until a dedicated cross-cochlea checkpoint is trained.)*
 
 See [`docs/evaluation_phases.md`](docs/evaluation_phases.md) for the complete Phase 0–3 ablation log, accepted/rejected hypotheses, training details, and per-clip tables (`31 / 31` pytest tests passing across `inversion_test.py` (17), `neural_test.py` (5), `benchmark_suite_test.py` (5), and `invert_nap_test.py` (4)).
 

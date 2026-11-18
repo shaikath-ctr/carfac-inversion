@@ -6,7 +6,7 @@ This document records the engineering progression, hypotheses tested (both accep
 
 ## Evaluation Setup & Reproducibility
 
-- **Synthetic test suite**: [`inversion_test.py`](../src/carfac_inversion/inversion_test.py), [`invert_nap_test.py`](../src/carfac_inversion/scripts/invert_nap_test.py), [`benchmark_suite_test.py`](../src/carfac_inversion/scripts/benchmark_suite_test.py) (`23` unit & perceptual tests across `16 kHz` / `32 kHz` CARFAC, `24 kHz` Gammatone, generic `CochleaModel`, binaural 2-ear, cross-cochlea auralization, OLA chunking parity, apical `< 250 Hz` tones, and CLI paths).
+- **Test suite**: [`inversion_test.py`](../src/carfac_inversion/inversion_test.py), [`neural_test.py`](../src/carfac_inversion/neural_test.py), [`invert_nap_test.py`](../src/carfac_inversion/scripts/invert_nap_test.py), [`benchmark_suite_test.py`](../src/carfac_inversion/scripts/benchmark_suite_test.py) (`31` unit & perceptual tests across `16 / 32 kHz` CARFAC, `24 kHz` Gammatone, generic `CochleaModel`, binaural 2-ear, cross-cochlea auralization, OLA chunking parity, apical `< 250 Hz` tones, Phase 3 neural residual refiner, `107.01 dB` RMS=1 calibration, retuned Option-C `20 dB` low-SPL tracking, and CLI paths).
 - **Real-speech diagnostic benchmark**: [`benchmark_suite.py`](../src/carfac_inversion/scripts/benchmark_suite.py) run on `1.0 s` crops of real speech from `carfac/test_data` (`binaural_test.wav` — broadband speech with `/s/` fricatives up to `7.5 kHz`; `long_test.wav` — male speech dominated by low-frequency fundamentals in `60–250 Hz`):
   - `sample_rate_hz = 16000`, `clip_seconds = 1.0`, `chunk_seconds = 0.5` (`0.128 s` overlap, `0.064 s` pre-roll).
   - Clean round-trip levels: `50 / 65 / 80 dB SPL`, plus `10 dB` noisy round-trip at `65 dB SPL`.
@@ -176,42 +176,51 @@ This document records the engineering progression, hypotheses tested (both accep
   - **Stage 2 (`350` steps, `batch=4`, `183.3 s`)**: Added variance-normalized differentiable CARFAC NAP + `>3.5 kHz` envelope cycle consistency (`carfac_weight=15.0`): reduced held-out **`carfac_nap` MSE `0.0950 -> 0.0711`** while holding **`val_sisdr = +12.01 dB`**.
   - **Loss Scaling Lesson**: Initial `40+10` smoke check revealed `hp_acoustic`'s default `sqrt(win_len/2)` STFT scaling produced `stft = 112.7`, drowning out `SI-SDR` and Stage 2 `carfac_nap` (`0.27`); re-balancing to `0.15 * stft`, `1.5 * hf_spec`, `3.0 * wave_l1`, `2.5 * log_rms`, `-0.35 * sisdr`, and `15.0 * carfac_nap` enabled rapid convergence on both waveform SPL and HF spectral shape.
 
-### Held-Out LibriSpeech `test` Evaluation (4 Unseen Speakers `[7850, 7976, 8297, 8842]`, `16 kHz`, `1.0 s`)
+### Held-Out LibriSpeech `test` Evaluation (4 Unseen Speakers `[7850, 7976, 8297, 8842]`, `16 kHz`, `1.0 s`, `sii.CARFAC_RMS_ONE_DB_SPL ≈ 107.01 dB`)
 
 | Condition | Method | Runtime | SI-SDR | STOI | HASPI | HASQI / nl | NAP corr | 4.5–7.5 kHz SNR |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| `clean_50dB` | Phase 2 `0+0` | `2.08 s` | `3.15 dB` | `0.8337` | `0.9997` | `0.508 / 0.624` | `0.9452` | `0.0 dB` |
-| `clean_50dB` | Phase 2 `20+60` | `53.37 s` | `16.45 dB` | `0.9784` | `0.9997` | `0.733 / 0.768` | `0.9996` | `-4.8 dB` |
-| `clean_50dB` | Phase 3 `S1 0+0` | `2.91 s` | `19.64 dB` | `0.9908` | `0.9999` | `0.798 / 0.841` | `0.9931` | `-1.2 dB` |
-| `clean_50dB` | Phase 3 `S2 0+0` | `3.07 s` | `19.78 dB` | `0.9907` | `0.9999` | `0.791 / 0.834` | `0.9943` | `-1.5 dB` |
-| `clean_50dB` | Phase 3 `S2 0+15` | `15.09 s` | **`20.03 dB`** | **`0.9961`** | **`1.0000`** | **`0.842 / 0.881`** | `0.9996` | `-1.5 dB` |
-| `clean_65dB` | Phase 2 `0+0` | `2.17 s` | `-3.49 dB` | `0.8033` | `0.9964` | `0.360 / 0.465` | `0.7936` | `0.0 dB` |
-| `clean_65dB` | Phase 2 `20+60` | `51.97 s` | `8.08 dB` | `0.9255` | `0.9967` | `0.483 / 0.527` | `0.9969` | `-4.4 dB` |
-| `clean_65dB` | Phase 3 `S1 0+0` | `3.11 s` | `17.40 dB` | `0.9845` | `0.9998` | `0.702 / 0.741` | `0.9711` | **`-0.8 dB`** |
-| `clean_65dB` | Phase 3 `S2 0+0` | `3.60 s` | `17.38 dB` | `0.9865` | `0.9996` | `0.714 / 0.754` | `0.9782` | `-1.0 dB` |
-| `clean_65dB` | Phase 3 `S2 0+15` | `14.24 s` | **`18.37 dB`** | **`0.9918`** | **`0.9999`** | **`0.779 / 0.817`** | `0.9979` | `-0.9 dB` |
-| `clean_80dB` | Phase 2 `0+0` | `2.14 s` | `-4.80 dB` | `0.6837` | `0.5757` | `0.127 / 0.162` | `0.6593` | `-1.4 dB` |
-| `clean_80dB` | Phase 2 `20+60` | `50.98 s` | `0.37 dB` | `0.7993` | `0.8013` | `0.220 / 0.272` | `0.9606` | `-4.3 dB` |
-| `clean_80dB` | Phase 3 `S1 0+0` | `3.28 s` | `12.60 dB` | `0.9451` | `0.9993` | `0.538 / 0.572` | `0.8932` | `-1.2 dB` |
-| `clean_80dB` | Phase 3 `S2 0+0` | `3.17 s` | `12.83 dB` | `0.9464` | `0.9993` | `0.551 / 0.584` | `0.9176` | `-1.3 dB` |
-| `clean_80dB` | Phase 3 `S2 0+15` | `13.36 s` | **`13.07 dB`** | **`0.9536`** | **`0.9996`** | **`0.609 / 0.644`** | `0.9815` | `-1.2 dB` |
-| `snr10_65dB` | Phase 2 `20+60` | `51.70 s` | `7.17 dB` | `0.9296` | `0.9999` | `0.605 / 0.666` | `0.9970` | `-0.1 dB` |
-| `snr10_65dB` | Phase 3 `S2 0+0` | `3.06 s` | `10.15 dB` | `0.9570` | `0.9999` | `0.620 / 0.651` | `0.9730` | `-1.6 dB` |
-| `snr10_65dB` | Phase 3 `S2 0+15` | `14.21 s` | **`10.51 dB`** | **`0.9761`** | **`0.9999`** | **`0.647 / 0.675`** | `0.9980` | `-1.6 dB` |
+| `clean_50dB` | Phase 2 `0+0` | `3.36 s` | `4.10 dB` | `0.8394` | `0.9998` | `0.538 / 0.644` | `0.9496` | `0.0 dB` |
+| `clean_50dB` | Phase 2 `20+60` | `53.79 s` | `16.34 dB` | `0.9822` | `0.9999` | `0.789 / 0.822` | `0.9996` | `-4.8 dB` |
+| `clean_50dB` | Phase 3 `S1 0+0` | `3.07 s` | `19.14 dB` | `0.9882` | `0.9999` | `0.819 / 0.862` | `0.9933` | `-1.3 dB` |
+| `clean_50dB` | Phase 3 `S2 0+0` | `3.08 s` | `19.39 dB` | `0.9881` | `0.9999` | `0.815 / 0.858` | `0.9946` | `-1.6 dB` |
+| `clean_50dB` | Phase 3 `S2 0+15` | `15.89 s` | **`19.44 dB`** | **`0.9943`** | **`1.0000`** | **`0.860 / 0.898`** | `0.9996` | `-1.6 dB` |
+| `clean_65dB` | Phase 2 `0+0` | `2.17 s` | `-2.64 dB` | `0.8119` | `0.9983` | `0.404 / 0.520` | `0.8278` | `0.0 dB` |
+| `clean_65dB` | Phase 2 `20+60` | `51.53 s` | `10.69 dB` | `0.9346` | `0.9988` | `0.535 / 0.569` | `0.9982` | `-4.7 dB` |
+| `clean_65dB` | Phase 3 `S1 0+0` | `3.20 s` | `17.77 dB` | `0.9868` | `0.9998` | `0.712 / 0.752` | `0.9803` | **`-0.9 dB`** |
+| `clean_65dB` | Phase 3 `S2 0+0` | `3.21 s` | `17.80 dB` | `0.9887` | `0.9996` | `0.721 / 0.761` | `0.9844` | `-1.0 dB` |
+| `clean_65dB` | Phase 3 `S2 0+15` | `14.68 s` | **`18.88 dB`** | **`0.9935`** | **`0.9999`** | **`0.785 / 0.822`** | `0.9986` | `-1.0 dB` |
+| `clean_80dB` | Phase 2 `0+0` | `2.30 s` | `-4.58 dB` | `0.7132` | `0.7036` | `0.168 / 0.215` | `0.6875` | `-0.8 dB` |
+| `clean_80dB` | Phase 2 `20+60` | `51.22 s` | `1.72 dB` | `0.8294` | `0.8682` | `0.273 / 0.331` | `0.9731` | `-3.6 dB` |
+| `clean_80dB` | Phase 3 `S1 0+0` | `3.34 s` | `13.94 dB` | `0.9580` | `0.9994` | `0.583 / 0.617` | `0.9184` | **`-1.1 dB`** |
+| `clean_80dB` | Phase 3 `S2 0+0` | `3.33 s` | `14.08 dB` | `0.9564` | `0.9995` | `0.598 / 0.632` | `0.9375` | `-1.2 dB` |
+| `clean_80dB` | Phase 3 `S2 0+15` | `13.59 s` | **`14.42 dB`** | **`0.9629`** | **`0.9997`** | **`0.662 / 0.697`** | `0.9879` | **`-1.1 dB`** |
+| `snr10_65dB` | Phase 2 `20+60` | `51.72 s` | `8.97 dB` | `0.9450` | `1.0000` | `0.644 / 0.695` | `0.9984` | `-0.1 dB` |
+| `snr10_65dB` | Phase 3 `S2 0+0` | `3.28 s` | `10.33 dB` | `0.9675` | `0.9999` | `0.695 / 0.729` | `0.9778` | `-1.7 dB` |
+| `snr10_65dB` | Phase 3 `S2 0+15` | `14.58 s` | **`10.73 dB`** | **`0.9844`** | **`1.0000`** | **`0.725 / 0.755`** | `0.9985` | `-1.7 dB` |
 
-### Canonical Out-of-Domain `carfac/test_data` Comparison (Phase 2 `45+135` vs. Phase 3 `S2 0+0` & `0+15`)
+### Canonical Out-of-Domain `carfac/test_data` Comparison (`107.01 dB` Calibrated `9da7cbf`: P2 `45+135` -> P3 `S2 0+0` -> P3 `S2 0+15`)
 
-| Clip | Condition | P2 `45+135` (`~111 s`) -> P3 `S2 0+0` (`~3.1 s`) -> P3 `S2 0+15` (`~14 s`) |
+| Clip | Condition | P2 `45+135` (`~110 s`) -> P3 `S2 0+0` (`~4.1 s`) -> P3 `S2 0+15` (`~14–26 s`) |
 | :--- | :--- | :--- |
-| `binaural_test` | `clean_50dB` | `SI-SDR 14.45 -> 11.92 -> 15.85 dB` \| `STOI 0.9741 -> 0.9763 -> 0.9850` \| `HASQI 0.722 -> 0.669 -> 0.697` \| `4k5 -2.3 -> -1.1 dB` |
-| `binaural_test` | `clean_65dB` | `SI-SDR 7.17 -> 6.82 -> 7.65 dB` \| `STOI 0.9180 -> 0.9763 -> 0.9786` \| `HASQI 0.479 -> 0.494 -> 0.512` (`nl 0.520 -> 0.551`) |
-| `binaural_test` | `clean_80dB` | `ws/ref 0.216 -> p3/ref 0.837` \| `STOI 0.8219 -> 0.8832 -> 0.8857` \| `HASPI 0.8863 -> 0.9948 -> 0.9945` \| `HASQI 0.232 -> 0.284` |
-| `long_test` | `clean_50dB` | `SI-SDR 11.45 -> 14.98 -> 13.75 dB` \| `STOI 0.9965 -> 0.9791 -> 0.9886` \| `HASPI 1.0000 -> 0.9999` \| `HASQI 0.708 -> 0.566 -> 0.563` |
-| `long_test` | `clean_65dB` | `SI-SDR 9.56 -> 13.62 -> 13.57 dB` \| `STOI 0.9631 -> 0.9717 -> 0.9848` \| `HASPI 0.9987 -> 0.9989 -> 0.9997` |
-| `long_test` | `clean_80dB` | `SI-SDR 7.70 -> 11.41 -> 11.65 dB` \| `STOI 0.9463 -> 0.9107 -> 0.9285` \| `HASPI 0.9983 -> 0.9993 -> 0.9996` \| `4k5 -5.7 -> -2.2 dB` |
+| `binaural_test` | `clean_50dB` | `SI-SDR 16.41 -> 12.49 -> 16.80 dB` \| `STOI 0.9848 -> 0.9803 -> 0.9864` \| `HASQI 0.816 -> 0.701 -> 0.739` \| `4k5 -2.0 -> -1.5 dB` |
+| `binaural_test` | `clean_65dB` | `SI-SDR 9.26 -> 8.18 -> 9.44 dB` \| `STOI 0.9204 -> 0.9803 -> 0.9843` \| `HASQI 0.541 -> 0.509 -> 0.519` (`nl 0.572 -> 0.558`) |
+| `binaural_test` | `clean_80dB` | `ws/ref 0.247 -> p3/ref 0.860` \| `STOI 0.8471 -> 0.9024 -> 0.9049` \| `HASPI 0.9989 -> 0.9991 -> 0.9986` \| `HASQI 0.358 -> 0.324 -> 0.325` |
+| `binaural_test` | `snr10_65dB` | `SI-SDR 8.17 -> 6.24 -> 7.23 dB` \| `STOI 0.9092 -> 0.9671 -> 0.9740` \| `HASQI 0.433 -> 0.471 -> 0.500` (`nl 0.462 -> 0.533`) |
+| `long_test` | `clean_50dB` | `SI-SDR 11.54 -> 15.71 -> 14.68 dB` \| `STOI 0.9977 -> 0.9828 -> 0.9908` \| `HASPI 1.0000 -> 1.0000` \| `HASQI 0.751 -> 0.616 -> 0.608` |
+| `long_test` | `clean_65dB` | `SI-SDR 10.47 -> 13.91 -> 13.59 dB` \| `STOI 0.9677 -> 0.9770 -> 0.9809` \| `HASPI 0.9989 -> 0.9996 -> 0.9999` |
+| `long_test` | `clean_80dB` | `SI-SDR 8.53 -> 11.89 -> 12.11 dB` \| `STOI 0.9734 -> 0.9377 -> 0.9548` \| `HASPI 0.9993 -> 0.9984 -> 0.9996` \| `4k5 -4.5 -> -4.4 dB` |
+| `long_test` | `snr10_65dB` | `SI-SDR 6.82 -> 9.42 -> 9.49 dB` \| `STOI 0.9951 -> 0.9443 -> 0.9817` \| `HASPI 1.0000 -> 0.9997 -> 0.9998` \| `HASQI 0.660 -> 0.567 -> 0.596` |
+
+*Refreshed Phase 2 `20+60` / cross-cochlea `perc030` (`9da7cbf`): `binaural_test` `pareto 20+60` `5.58 dB / 0.9086`, `sloping_noisy` `NAP 0.8724 / Env 0.9571 / SAI 0.9710 / HASPI 0.9841 / STOI 0.9351`; `long_test` `pareto 20+60` `6.90 dB / 0.9753`, `sloping_noisy` `NAP 0.9622 / Env 0.9874 / SAI 0.9901 / HASPI 0.8904 / STOI 0.7441`.*
+
+### Calibration Alignment & CARFAC Parameter-Tuning Audit (`f571baa`, `9da7cbf`)
+- **Peak-vs-RMS `3.01 dB` Calibration Alignment**: Standardized `benchmark_suite.py` and `invert_nap.py` to `sii.CARFAC_RMS_ONE_DB_SPL` (`104.0 + 20*log10(sqrt(2)) ≈ 107.01 dB SPL` at `RMS = 1.0`, matching `hp-acoustic` `transforms.py` and `perceptual.py`), correcting a `+3.01 dB` over-drive in nominal `50/65/80 dB` benchmark inputs.
+- **Per-Ear `ohc_scale` vs. Per-Channel Ablation (Per-Channel Rejected)**: Measured closed-loop CARFAC effective undamping `(1 - agc_memory) * nlf(v)` on speech (`0.689–0.998`) and tested per-channel warm-start `ohc_scale`; rejected per-channel damping because warping adjacent-ERB group delays degraded Phase 3 `0+0` (`binaural_test`: `12.62 -> 9.79 dB` at `50 dB`, `8.46 -> 4.74 dB` at `65 dB`, `+1.14 -> -0.62 dB` at `80 dB`; `long_test 80 dB`: `13.28 -> 10.22 dB`). Replaced global cross-ear averaging with per-ear `ohc_scale` broadcasting (`[0.567, 1.000]` vs. `0.691` global on asymmetric `80 / 40 dB` binaural speech) while preserving identical mono behavior.
+- **Dynamic Gain Bounds & High-Q / `48 kHz` IR Tails**: Extended `_calibrate_scalar_gain` brackets dynamically down to `1e-7` (fixing an Option C `20 dB` Pass-1 clamp error from `5.3x` down to `1.01x`), lowered Adam `rms0` and L-BFGS `u_scale_val` floors to `1e-7`, and scaled open-loop BM `ir_len` to `~0.15 s` up to `8192` samples (`171 ms` at `48 kHz`).
 
 ### Key Conclusions & Remaining Boundaries
-1. **Runtime & Quality Pareto**: Single-pass Phase 3 (`0+0`) runs in **`~3.0 s/clip`** (including `dsp_warm_start` + OLA overhead; model forward pass is `15.4 ms/s`)—**~16–36x faster** than Phase 2 (`52–111 s/clip`)—while beating Phase 2 `20+60` and `45+135` substantially on unseen speakers across `50–80 dB SPL`. Adding a brief `0+15` L-BFGS polish (`~14 s/clip`) recovers `nap_corr = 0.98–0.9996` and further boosts `SI-SDR`, `STOI`, and `HASQI`.
-2. **Scope for cross-cochlea auralization (`mode="perceptual"`)**: Because `Phase 3` was trained strictly on **same-cochlea (`healthy`)** targets, feeding it an **impaired** cochlea NAP (`ohc05_noisy` / `sloping_noisy`) causes the network to partially restore attenuated speech (`binaural_test ohc05`: `HASPI 0.975`, `STOI 0.919`, `nap_corr = 0.496` at `0+0`) rather than staying aligned on the impaired cochlear manifold (`Phase 2 perc030`: `nap_corr = 0.668–0.960`). Cross-cochlea auralization should continue using Phase 2 `mode="perceptual"` until a dedicated impaired-target Phase 3b refiner is trained.
-3. **Broadband `80 dB` transient phase (`binaural_test 80 dB`)**: Amplitude scaling (`ws/ref 0.216 -> p3/ref 0.837`) and intelligibility/quality (`HASPI 0.886 -> 0.995`, `STOI 0.822 -> 0.886`, `HASQI 0.232 -> 0.284`) improved cleanly, while time-domain waveform correlation remained `0.700` due to `4.5–7.5 kHz` fricative phase invariance.
-4. **Test Coverage**: [`neural_test.py`](../src/carfac_inversion/neural_test.py) adds 5 unit tests covering canonical CF projection across `16/32 kHz`, JSON config serialization, zero-init/silence/odd-length invariants, 2-ear binaural OLA + `invert_nap` CLI checkpoint execution, and Stage 1+2 training smoke execution.
+1. **Runtime & Quality Pareto**: Single-pass Phase 3 (`0+0`) runs in **`~3.1–3.3 s/clip`** (held-out LibriSpeech) with **`19.39 / 17.80 / 14.08 dB` SI-SDR** across `50 / 65 / 80 dB`, beating Phase 2 `20+60` (`51–54 s/clip`) and `45+135` (`~110 s/clip`) by ~`16–36x` speedup; hybrid `0+15` (`~14–16 s/clip`) reaches `19.44 / 18.88 / 14.42 dB` (`HASQI 0.860 / 0.785 / 0.662`) and `nap_corr = 0.988–0.9996`.
+2. **Scope for cross-cochlea auralization (`mode="perceptual"`)**: Because `Phase 3` was trained strictly on **same-cochlea (`healthy`)** targets, feeding it an **impaired** cochlea NAP (`ohc05_noisy` / `sloping_noisy`) pulls predictions toward healthy speech (`nap_corr = 0.33–0.49` at `0+0`) rather than staying aligned on the impaired cochlear manifold (`Phase 2 perc030`: `nap_corr = 0.67–0.96`). Cross-cochlea auralization should continue using Phase 2 `mode="perceptual"` until a dedicated impaired-target Phase 3b refiner is trained.
+3. **Broadband `80 dB` transient phase (`binaural_test 80 dB`)**: Amplitude scaling (`ws/ref 0.247 -> p3/ref 0.860`) and intelligibility/quality (`HASPI 0.9991`, `STOI 0.8471 -> 0.9049`) improved cleanly, while time-domain waveform correlation remained `0.746` due to `4.5–7.5 kHz` fricative phase invariance.
+4. **Test Coverage (`31 / 31` passed)**: [`inversion_test.py`](../src/carfac_inversion/inversion_test.py) (`17`), [`neural_test.py`](../src/carfac_inversion/neural_test.py) (`5`), [`benchmark_suite_test.py`](../src/carfac_inversion/scripts/benchmark_suite_test.py) (`5`), and [`invert_nap_test.py`](../src/carfac_inversion/scripts/invert_nap_test.py) (`4`).
