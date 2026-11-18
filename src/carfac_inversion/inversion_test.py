@@ -485,6 +485,22 @@ class CarfacInversionTest(parameterized.TestCase):
       float(np.corrcoef(nap_ws.ravel(), nap.ravel())[0, 1]), 0.90
     )
 
+    # Also verify Adam+L-BFGS optimization at sub-1e-5 RMS preserves low-SPL tracking.
+    res_c = inversion.invert_nap(
+      nap,
+      model_c,
+      inversion.InversionConfig(
+        mode="exact", adam_steps=10, lbfgs_steps=10, chunk_seconds=None
+      ),
+    )
+    est_rms = float(np.sqrt(np.mean(res_c.waveform**2)))
+    self.assertGreater(est_rms, true_rms * 0.5)
+    self.assertLess(est_rms, true_rms * 1.6)
+    self.assertGreater(
+      float(np.corrcoef(res_c.reconstructed_nap.ravel(), nap.ravel())[0, 1]),
+      0.97,
+    )
+
 
 if __name__ == "__main__":
   absltest.main()

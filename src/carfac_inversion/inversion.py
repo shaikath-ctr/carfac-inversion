@@ -1204,7 +1204,8 @@ def _optimize_window(
   loss_history: list[float] = []
 
   if config.adam_steps > 0:
-    rms0 = max(float(jnp.sqrt(jnp.mean(current_w**2))), 1e-5)
+    raw_rms = float(jnp.sqrt(jnp.mean(current_w**2)))
+    rms0 = 1e-5 if raw_rms < 1e-9 else max(raw_rms, 1e-7)
     init_lr = config.adam_lr_scale * rms0
     adam_state = _ADAM_TRANSFORM.init(current_w)
 
