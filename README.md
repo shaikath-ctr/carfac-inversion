@@ -51,14 +51,26 @@ is attenuated into positive temporal envelopes.
      `>4 kHz` harmonic/fricative fine structure in a single feedforward pass
      (`~15 ms/s` neural forward, `~3 s/clip` total at `0+0` vs `~111 s` L-BFGS),
      optionally followed by a brief L-BFGS polish (`0+15`).
-   - Trained in two stages on speaker-disjoint LibriSpeech `dev-clean` (`32`
-     train speakers / `766` windows spanning `43–86 dB SPL` + clean/noisy;
-     `4` val speakers / `64` windows; `4` test speakers): Stage 1 (`1400` steps)
-     optimizes re-balanced multi-resolution STFT (`2048/1024/512/128`),
-     `3.8–7.8 kHz` HF log-magnitude MSE, RMS-normalized L1, `log_rms`,
-     `-SI-SDR`, and `<20 Hz` drift (`val_sisdr -3.41 -> +12.06 dB`); Stage 2
-     (`350` steps) adds differentiable CARFAC NAP + `>3.5 kHz` envelope cycle
-     consistency (`carfac_nap` val MSE `0.0950 -> 0.0711`).
+   - Trained for each inversion mode on speaker-disjoint LibriSpeech `dev-clean`:
+     - **Phase 3 (`mode="exact"`, `phase3_refiner.npz`)**: Two-stage training
+       (`32` train speakers / `766` windows spanning `43–86 dB SPL` +
+       clean/noisy; `4` val speakers / `64` windows; `4` test speakers): Stage 1
+       (`1400` steps) optimizes re-balanced multi-resolution STFT
+       (`2048/1024/512/128`), `3.8–7.8 kHz` HF log-magnitude MSE, RMS-normalized
+       L1, `log_rms`, `-SI-SDR`, and `<20 Hz` drift (`val_sisdr -3.41 -> +12.06 dB`);
+       Stage 2 (`350` steps) adds differentiable CARFAC NAP + `>3.5 kHz` envelope
+       cycle consistency (`carfac_nap` val MSE `0.0950 -> 0.0711`).
+     - **Phase 3b (`mode="perceptual"`, `phase3b_perceptual.npz`)**:
+       Self-supervised differentiable CARFAC perceptual training
+       (`--objective=perceptual`, `900` steps, `batch=8`, `720` train windows
+       across `16` impairment profiles spanning OHC loss, sloping HF loss,
+       conductive loss, middle-ear filtering, `v_half_shift`, and
+       `fiber_retention`; `96` val windows across `8` held-out profiles):
+       minimizes `2 ms`/`8 ms` NAP envelopes, SAI fine timing, `0.30` raw NAP
+       MSE, `<35 Hz` drift, and HF smoothness (`hf_diff_weight=0.03`), lowering
+       val perceptual loss from `0.2635 -> 0.1722` (`val NAP corr 0.7998 -> 0.8393`).
+       Checkpoints record `target_mode` (`"exact"` or `"perceptual"`) and log
+       a warning if paired with the opposite inversion mode.
 3. **Scale-Invariant JAX Optimization (`invert_nap`)**:
    - Projects iterates onto the audible band `[cutoff_low_hz, cutoff_high_hz]`
      (default low edge `35 Hz` with an `18 Hz` cosine taper) in rFFT space to
@@ -169,6 +181,21 @@ python -m carfac_inversion.scripts.invert_nap \
   --level_db_spl=80.0 \
   --neural_checkpoint=tmp/phase3_refiner.npz \
   --adam_steps=0 --lbfgs_steps=15
+
+# Cross-cochlea Phase 3b perceptual training & fast 0+15 auralization (~16 s/clip):
+python -m carfac_inversion.scripts.train_neural_refiner \
+  --objective=perceptual \
+  --train_cache=/path/to/phase3b_train_cache.npz \
+  --val_cache=/path/to/phase3b_val_cache.npz \
+  --output_checkpoint=tmp/phase3b_perceptual.npz
+
+python -m carfac_inversion.scripts.invert_nap \
+  --input_wav=input.wav \
+  --output_wav=auralized_p3b.wav \
+  --mode=perceptual \
+  --source_ohc_health=0.5 \
+  --neural_checkpoint=tmp/phase3b_perceptual.npz \
+  --adam_steps=0 --lbfgs_steps=15
 ```
 
 ## Approach & Phased Evaluation Methodology
@@ -214,6 +241,15 @@ recorded with accepted/rejected ablations in
   gain error from `5.3x` to `1.01x`), scaled open-loop BM `ir_len` up to `8192`
   at `48 kHz`, and moved `ohc_scale` per ear after ablations showed per-channel
   `ohc_scale` hurt Phase 3 (`-1.7` to `-3.7 dB` SI-SDR). (**31 / 31** tests.)
+- **Phase 3b (Self-Supervised Cross-Cochlea Neural Auralization)**: Trained a
+  dedicated `mode="perceptual"` refiner (`phase3b_perceptual.npz`) end-to-end
+  under differentiable CARFAC perceptual cycle loss (`2/8 ms` NAP envelopes +
+  SAI fine timing + raw NAP + `<35 Hz` drift + `hf_diff_weight=0.03` HF hiss
+  control), lifting `0+0` held-out cross-cochlea alignment (`NAP 0.8473 -> 0.8641`,
+  `Env 0.9230 -> 0.9336`, `SAI 0.9063 -> 0.9205` across 4 unseen speakers x 4
+  impairment profiles) and matching Phase 2 `20+60` (`56.78 s`) at `0+15` in
+  `16.49 s` (`3.4x` faster; `NAP 0.8755`, `Env 0.9613`, `SAI 0.9425`,
+  `HASQI 0.160`). (**34 / 34** tests.)
 
 ## What the Metrics Mean
 
@@ -253,9 +289,18 @@ Headline metrics on **4 held-out LibriSpeech speakers** (`[7850, 7976, 8297, 884
 
 Highlights on canonical out-of-domain `carfac/test_data` (`binaural_test.wav` & `long_test.wav`) & scope boundaries:
 - **Round-trip (`mode="exact"`, DSP + `45+135` L-BFGS @ `~110 s` -> DSP + Neural + `0+15` L-BFGS @ `~14–26 s`)**: `binaural_test` reached `SI-SDR 16.80 dB / STOI 0.9864` at `50 dB`, `SI-SDR 9.26 -> 9.44 dB` / `STOI 0.9204 -> 0.9843` at `65 dB`, and `STOI 0.8471 -> 0.9049` / `HASPI 0.9989 -> 0.9986` / `SI-SDR 1.38 -> 1.06 dB` at `80 dB` (`ws/ref 0.247 -> p3/ref 0.860`); `long_test` improved from `10.47 -> 13.59 dB` (`13.91 dB` at `0+0`) at `65 dB` and `8.53 -> 12.11 dB` at `80 dB`.
-- **Cross-cochlea auralization (`mode="perceptual"`, `perc030`)**: On `sloping` hearing loss (`65 dB`, 10 dB noisy), achieved `NAP corr 0.8724 / 0.9622`, `Env corr 0.9571 / 0.9874`, `SAI corr 0.9710 / 0.9901`, `HASPI 0.9841 / 0.8904`, and `STOI 0.9351 / 0.7441` (`binaural_test` / `long_test`). *(Scope caveat: the trained neural checkpoint targets same-cochlea `mode="exact"` reconstruction; passing impaired NAPs pulls output back toward healthy speech rather than staying on the impaired cochlear manifold (`nap_corr 0.33–0.49` vs. `perc030` `0.67–0.96`), so cross-cochlea auralization should use `mode="perceptual"` without the `exact`-trained checkpoint until a dedicated cross-cochlea checkpoint is trained.)*
+- **Cross-cochlea auralization (`mode="perceptual"`, Phase 2 `45+135` vs. Phase 3b `0+0` / `0+15`)**:
 
-See [`docs/evaluation_phases.md`](docs/evaluation_phases.md) for the complete Phase 0–3 ablation log, accepted/rejected hypotheses, training details, and per-clip tables (`31 / 31` pytest tests passing across `inversion_test.py` (17), `neural_test.py` (5), `benchmark_suite_test.py` (5), and `invert_nap_test.py` (4)).
+![Phase 3b Cross-Cochlea Neural Auralization Across 4 Unseen LibriSpeech Speakers](docs/phase3b_progression.png)
+
+  - **Held-out LibriSpeech (`4` unseen speakers × `4` impairment profiles `ohc05`, `sloping`, `cond_20_30`, `mix_ohc06_cond`, `10 dB` SNR = `16` paired cases)**:
+    - Phase 2 Warm Start (`0+0`, `2.59 s`): `NAP 0.8473 | Env 0.9230 | SAI 0.9063 | STOI 0.9584 | HASPI 0.9052 | HASQI 0.144`
+    - Phase 2 L-BFGS (`20+60`, `56.78 s`): `NAP 0.8760 | Env 0.9622 | SAI 0.9430 | STOI 0.8400 | HASPI 0.8991 | HASQI 0.165`
+    - **Phase 3b Neural (`0+0`, `3.39 s`)**: `NAP 0.8641 | Env 0.9336 | SAI 0.9205 | STOI 0.8420 | HASPI 0.8797 | HASQI 0.141`
+    - **Phase 3b Hybrid (`0+15`, `16.49 s`)**: `NAP 0.8755 | Env 0.9613 | SAI 0.9425 | STOI 0.8321 | HASPI 0.8856 | HASQI 0.160` (`3.4x` faster than `20+60`)
+  - **Canonical `carfac/test_data` (`8` clips)**: `Phase 3b 0+15` (`15.37 s`) reaches `NAP 0.7981 | Env 0.9292 | SAI 0.9348 | HASPI 0.9379 | HASQI 0.201`, vs. Phase 2 `20+60` (`54.75 s`: `0.8127 / 0.9428 / 0.9425`) and `45+135` (`~120 s`: `0.8159 / 0.9464 / 0.9437`). Pass `target_mode="perceptual"` checkpoints (e.g. `phase3b_perceptual.npz`) via `--perceptual_neural_checkpoint` in `benchmark_suite.py` or `--neural_checkpoint` in `invert_nap.py --mode=perceptual`; using an `"exact"` checkpoint in `mode="perceptual"` now logs a clear mismatch warning.
+
+See [`docs/evaluation_phases.md`](docs/evaluation_phases.md) for the complete Phase 0–3b ablation log, accepted/rejected hypotheses, training details, and per-clip tables (`34 / 34` pytest tests passing across `inversion_test.py` (17), `neural_test.py` (7), `benchmark_suite_test.py` (6), and `invert_nap_test.py` (4)).
 
 ## Development
 

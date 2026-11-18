@@ -1,12 +1,12 @@
 # CARFAC NAP-to-Audio Inversion — Phased Evaluation & Ablation Log
 
-This document records the engineering progression, hypotheses tested (both accepted and falsified), and quantitative benchmarks across **Phase 0**, **Phase 1**, **Phase 2**, and **Phase 3** of [`carfac-inversion`](../README.md), providing an auditable reference for downstream PR review.
+This document records the engineering progression, hypotheses tested (both accepted and falsified), and quantitative benchmarks across **Phase 0**, **Phase 1**, **Phase 2**, **Phase 3**, and **Phase 3b** of [`carfac-inversion`](../README.md), providing an auditable reference for downstream PR review.
 
 ---
 
 ## Evaluation Setup & Reproducibility
 
-- **Test suite**: [`inversion_test.py`](../src/carfac_inversion/inversion_test.py), [`neural_test.py`](../src/carfac_inversion/neural_test.py), [`invert_nap_test.py`](../src/carfac_inversion/scripts/invert_nap_test.py), [`benchmark_suite_test.py`](../src/carfac_inversion/scripts/benchmark_suite_test.py) (`31` unit & perceptual tests across `16 / 32 kHz` CARFAC, `24 kHz` Gammatone, generic `CochleaModel`, binaural 2-ear, cross-cochlea auralization, OLA chunking parity, apical `< 250 Hz` tones, Phase 3 neural residual refiner, `107.01 dB` RMS=1 calibration, retuned Option-C `20 dB` low-SPL tracking, and CLI paths).
+- **Test suite**: [`inversion_test.py`](../src/carfac_inversion/inversion_test.py), [`neural_test.py`](../src/carfac_inversion/neural_test.py), [`invert_nap_test.py`](../src/carfac_inversion/scripts/invert_nap_test.py), [`benchmark_suite_test.py`](../src/carfac_inversion/scripts/benchmark_suite_test.py) (`34` unit & perceptual tests across `16 / 32 kHz` CARFAC, `24 kHz` Gammatone, generic `CochleaModel`, binaural 2-ear, cross-cochlea auralization, OLA chunking parity, apical `< 250 Hz` tones, Phase 3 & Phase 3b neural residual refiners, `target_mode` safety checks, `107.01 dB` RMS=1 calibration, retuned Option-C `20 dB` low-SPL tracking, and CLI/benchmark paths).
 - **Real-speech diagnostic benchmark**: [`benchmark_suite.py`](../src/carfac_inversion/scripts/benchmark_suite.py) run on `1.0 s` crops of real speech from `carfac/test_data` (`binaural_test.wav` — broadband speech with `/s/` fricatives up to `7.5 kHz`; `long_test.wav` — male speech dominated by low-frequency fundamentals in `60–250 Hz`):
   - `sample_rate_hz = 16000`, `clip_seconds = 1.0`, `chunk_seconds = 0.5` (`0.128 s` overlap, `0.064 s` pre-roll).
   - Clean round-trip levels: `50 / 65 / 80 dB SPL`, plus `10 dB` noisy round-trip at `65 dB SPL`.
@@ -223,4 +223,46 @@ This document records the engineering progression, hypotheses tested (both accep
 1. **Runtime & Quality Pareto**: Single-pass Phase 3 (`0+0`) runs in **`~3.1–3.3 s/clip`** (held-out LibriSpeech) with **`19.39 / 17.80 / 14.08 dB` SI-SDR** across `50 / 65 / 80 dB`, beating Phase 2 `20+60` (`51–54 s/clip`) and `45+135` (`~110 s/clip`) by ~`16–36x` speedup; hybrid `0+15` (`~14–16 s/clip`) reaches `19.44 / 18.88 / 14.42 dB` (`HASQI 0.860 / 0.785 / 0.662`) and `nap_corr = 0.988–0.9996`.
 2. **Scope for cross-cochlea auralization (`mode="perceptual"`)**: Because `Phase 3` was trained strictly on **same-cochlea (`healthy`)** targets, feeding it an **impaired** cochlea NAP (`ohc05_noisy` / `sloping_noisy`) pulls predictions toward healthy speech (`nap_corr = 0.33–0.49` at `0+0`) rather than staying aligned on the impaired cochlear manifold (`Phase 2 perc030`: `nap_corr = 0.67–0.96`). Cross-cochlea auralization should continue using Phase 2 `mode="perceptual"` until a dedicated impaired-target Phase 3b refiner is trained.
 3. **Broadband `80 dB` transient phase (`binaural_test 80 dB`)**: Amplitude scaling (`ws/ref 0.247 -> p3/ref 0.860`) and intelligibility/quality (`HASPI 0.9991`, `STOI 0.8471 -> 0.9049`) improved cleanly, while time-domain waveform correlation remained `0.746` due to `4.5–7.5 kHz` fricative phase invariance.
-4. **Test Coverage (`31 / 31` passed)**: [`inversion_test.py`](../src/carfac_inversion/inversion_test.py) (`17`), [`neural_test.py`](../src/carfac_inversion/neural_test.py) (`5`), [`benchmark_suite_test.py`](../src/carfac_inversion/scripts/benchmark_suite_test.py) (`5`), and [`invert_nap_test.py`](../src/carfac_inversion/scripts/invert_nap_test.py) (`4`).
+4. **Cross-Cochlea Auralization Extension**: Addressed in **Phase 3b** below via self-supervised differentiable CARFAC perceptual training (`--objective=perceptual`).
+
+---
+
+## Phase 3b: Self-Supervised Cross-Cochlea Perceptual Neural Refiner (`--objective=perceptual`)
+
+### Design, Diagnostics & Engineering Changes
+- **Self-Supervised Perceptual Cycle Loss (`compute_perceptual_refiner_losses` in [`train_neural_refiner.py`](../src/carfac_inversion/scripts/train_neural_refiner.py))**:
+  - Cross-cochlea hearing-loss auralization (`mode="perceptual"`) has no exact source-domain target waveform because the hearing loss alters overall loudness (`est/src ~ 0.1–0.7x`), HF attenuation, and OHC traveling-wave group delay. Phase 3b instead optimizes `NapResidualRefiner` self-supervisedly directly against `healthy` CARFAC perceptual cycle consistency (`2 ms` + `8 ms` rectified NAP envelopes `0.70` global / `0.30` channel-normalized, `SaiHypers(fft_len=2048)` SAI fine timing, and `perceptual_nap_weight = 0.30` raw NAP MSE), plus a `< 35 Hz` infrasound drift penalty (`drift_weight = 0.5`).
+  - **Safeguards discovered via ablation**:
+    1. **Relative channel floor (`ch_scale_rel_floor = 0.03 * max_c`)**: On synaptopathy/IHC-shift profiles (`v_half_shift`, `fiber_retention`), resting NAP equilibrium shifts downward (`-0.086` to `-0.089`), leaving weak HF channels near zero after baseline rectification; without the `0.03 * max_c` floor, those channels inflated `env_loss` by >100x (`val_fiber_04` `29.285 -> 0.095`, `val_vhalf_02` `13.699 -> 0.146`) while still keeping `SAI` `1e-12` variance floors for quiet `50 dB` conductive clips.
+    2. **HF carrier hiss control (`hf_diff_weight = 0.03`)**: Pure perceptual loss without spectral smoothness allowed an unregularized 150-step ablation to inject `+20.2 dB` of carrier hiss in `4.5–7.5 kHz` (`long_test sloping_noisy` `STOI = 0.6509`); adding `hf_diff_weight` eliminated excess HF hiss (`4.5–7.5 kHz` `-12.3` to `-26.0 dB` relative to `45+135`, boosting canonical mean `HASPI` `0.9023 -> 0.9200` in 200-step checks).
+    3. **Initialization & Oracle Ablations (Zero-Init Self-Supervised Selected)**: Zero-init outperformed warm-initializing from `phase3_refiner.npz` (`init val_loss = 0.2599` vs. `1702.26`, `HASPI 0.9023` vs. `0.8114`). A two-stage comparison initializing Stage 2 perceptual training from Stage 1 `20+60` oracle distillation (`160` train / `24` val clips, `900` steps -> `600` steps, `best_val = 0.1840`, `val nap_corr = 0.8306`) also trailed pure self-supervised `900`-step zero-init (`best_val = 0.1722`, `val nap_corr = 0.8393`, better held-out `NAP`/`Env`/`SAI` at `0+0`).
+- **Mode-Safety & Benchmark Integration**:
+  - [`NeuralRefinerConfig.target_mode`](../src/carfac_inversion/neural.py) (`"exact"` default, preserving full backwards compatibility with legacy exact `.npz` JSON headers) + `expected_mode` logging check in [`refine_waveform`](../src/carfac_inversion/neural.py) / [`invert_nap`](../src/carfac_inversion/inversion.py) so passing an `"exact"` checkpoint to `mode="perceptual"` (or vice versa) logs an explicit warning.
+  - Added `--perceptual_neural_checkpoint` to [`benchmark_suite.py`](../src/carfac_inversion/scripts/benchmark_suite.py) so `roundtrip`/`pareto` and `auralization` (`mode="perceptual"`) route to their respective checkpoints cleanly.
+
+### Multi-Impairment Dataset & Training (`phase3b_perceptual.npz`, `4.6 MiB`)
+- **Speaker-disjoint LibriSpeech `dev-clean` caches** (`sii.CARFAC_RMS_ONE_DB_SPL ≈ 107.01 dB`, zero overlap with `test` `[7850, 7976, 8297, 8842]`):
+  - **Train (`32` speakers, `720` x `1.0 s` windows, `16` cochlear profiles)**: `healthy`, flat OHC (`0.80`, `0.60`, `0.45`, `0.30`, `0.20`), sloping HF (`[1.0->0.40]`, `[0.95->0.25]`, `[1.0->0.12]`), rising (`[0.35->0.90]`), conductive (`(15, 25)` & `(25, 35)` dB), mixed OHC+conductive, sloping+`MiddleEarFilterConfig`, `v_half_shift=0.015`, `fiber_retention=0.5` across `43–84 dB SPL` (`clean`, `5–20 dB` noisy, and compressed/tilted variants).
+  - **Val (`4` speakers `[6295, 6313, 6319, 6345]`, `96` x `1.0 s` windows, `8` held-out profiles)**: `val_ohc05`, `val_sloping`, `val_ohc025`, `val_cond_20_30`, `val_mix_ohc06_cond`, `val_ski_slope`, `val_vhalf_02`, `val_fiber_04`.
+- **Training (`900` steps, `batch=8`, `lr=7e-4` cosine decay, `drift_weight=0.5`, `hf_diff_weight=0.03`, `1169.5 s`)**:
+  - `val_loss`: `0.2635` (init) -> `0.1722` (step `900`); `env`: `0.1621 -> 0.0854`; `sai`: `0.3006 -> 0.1965`; `nap`: `0.3983 -> 0.2944`; `<35 Hz drift`: `0.0004`; `val nap_corr`: **`0.7998 -> 0.8393`**.
+
+### Held-Out LibriSpeech Cross-Cochlea Evaluation (`4` Unseen Speakers `[7850, 7976, 8297, 8842]`, `16 kHz`, `1.0 s`)
+
+| Condition / Profile | Method | Runtime | NAP corr | 200 Hz Env corr | SAI corr | STOI | HASPI | HASQI / nl |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Noisy `10 dB` Mean (`16` cases)** | Phase 2 Warm Start (`0+0`) | `2.59 s` | `0.8473` | `0.9230` | `0.9063` | `0.9584` | `0.9052` | `0.144 / 0.202` |
+| **Noisy `10 dB` Mean (`16` cases)** | Phase 2 L-BFGS (`20+60`) | `56.78 s` | `0.8760` | `0.9622` | `0.9430` | `0.8400` | `0.8991` | `0.165 / 0.234` |
+| **Noisy `10 dB` Mean (`16` cases)** | **Phase 3b Neural (`0+0`)** | **`3.39 s`** | **`0.8641`** | **`0.9336`** | **`0.9205`** | `0.8420` | `0.8797` | `0.141 / 0.199` |
+| **Noisy `10 dB` Mean (`16` cases)** | **Phase 3b Hybrid (`0+15`)** | **`16.49 s`** | **`0.8755`** | **`0.9613`** | **`0.9425`** | `0.8321` | `0.8856` | **`0.160 / 0.225`** |
+| `ohc05` (`0.5` flat OHC) | `P2 0+0 -> P3b 0+0 -> P3b 0+15` | `2.6 -> 3.4 -> 16.5 s` | `0.7138 -> 0.7220 -> 0.7308` | `0.8563 -> 0.8600 -> 0.9212` | `0.8289 -> 0.8319 -> 0.8780` | `0.975 -> 0.851 -> 0.794` | `0.945 -> 0.911 -> 0.902` | `0.115 -> 0.097 -> 0.122` |
+| `sloping` (`0.95->0.20`) | `P2 0+0 -> P3b 0+0 -> P3b 0+15` | `2.6 -> 3.4 -> 16.5 s` | `0.9158 -> 0.9320 -> 0.9540` | `0.9549 -> 0.9706 -> 0.9858` | `0.9429 -> 0.9702 -> 0.9872` | `0.958 -> 0.793 -> 0.790` | `0.998 -> 0.994 -> 0.979` | `0.297 -> 0.312 -> 0.303` |
+| `cond_20_30` (`(20, 30)` dB) | `P2 0+0 -> P3b 0+0 -> P3b 0+15` | `2.6 -> 3.4 -> 16.5 s` | `0.9653 -> 0.9848 -> 0.9991` | `0.9789 -> 0.9894 -> 0.9993` | `0.9863 -> 0.9951 -> 1.0000` | `0.915 -> 0.862 -> 0.909` | `0.936 -> 0.939 -> 0.956` | `0.119 -> 0.121 -> 0.169` |
+| `mix_ohc06_cond` | `P2 0+0 -> P3b 0+0 -> P3b 0+15` | `2.6 -> 3.4 -> 16.5 s` | `0.7943 -> 0.8176 -> 0.8181` | `0.9018 -> 0.9144 -> 0.9388` | `0.8673 -> 0.8849 -> 0.9049` | `0.986 -> 0.862 -> 0.835` | `0.742 -> 0.674 -> 0.706` | `0.045 -> 0.033 -> 0.045` |
+| **All `32` (`clean`+`noisy`)** | `P2 0+0 -> P3b 0+0 -> P3b 0+15` | `2.50 -> 3.72 -> 16.52 s` | `0.8476 -> 0.8642 -> 0.8755` | `0.9232 -> 0.9339 -> 0.9612` | `0.9061 -> 0.9206 -> 0.9425` | `0.962 -> 0.869 -> 0.862` | `0.705 -> 0.691 -> 0.720` | `0.111 -> 0.110 -> 0.127` |
+
+- **Canonical `carfac/test_data` Mean (`8` clips: `ohc05_noisy`, `sloping_noisy`, `ohc05_shaca`, `sloping_shaca` on `binaural_test` & `long_test`)**:
+  - `Phase 2 0+0` (`2.50 s`): `NAP 0.7177 | Env 0.8378 | SAI 0.8763 | HASPI 0.9454 | HASQI 0.201`
+  - **`Phase 3b 0+0`** (`3.41 s`): `NAP 0.7164 | Env 0.8500 (+0.0122) | SAI 0.9009 (+0.0246) | HASPI 0.9361 | HASQI 0.174`
+  - **`Phase 3b 0+15`** (`15.37 s`): **`NAP 0.7981 | Env 0.9292 | SAI 0.9348 | HASPI 0.9379 | HASQI 0.201 (nl=0.305)`** — matches/edges Phase 2 `0+15` (`0.7964 / 0.9285 / 0.9347`) and recovers ~98% of Phase 2 `20+60` (`54.75 s`: `0.8127 / 0.9428 / 0.9425`) and `45+135` (`~120 s`: `0.8159 / 0.9464 / 0.9437`) in **`~3.5x–7.8x` less runtime**.
+- **Test Coverage (`34 / 34` passed)**: [`inversion_test.py`](../src/carfac_inversion/inversion_test.py) (`17`), [`neural_test.py`](../src/carfac_inversion/neural_test.py) (`7`), [`benchmark_suite_test.py`](../src/carfac_inversion/scripts/benchmark_suite_test.py) (`6`), and [`invert_nap_test.py`](../src/carfac_inversion/scripts/invert_nap_test.py) (`4`).

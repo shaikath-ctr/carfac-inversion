@@ -34,10 +34,49 @@ class NeuralRefinerTest(absltest.TestCase):
 
   def test_config_json_roundtrip(self):
     cfg = neural.NeuralRefinerConfig(
-      dim=96, dilations=(1, 2, 4), unet_base_dim=16
+      dim=96, dilations=(1, 2, 4), unet_base_dim=16, target_mode="perceptual"
     )
     restored = neural.NeuralRefinerConfig.from_json(cfg.to_json())
     self.assertEqual(cfg, restored)
+
+    # Older exact checkpoints omit target_mode and should default to "exact".
+    legacy_json = cfg.to_json().replace(', "target_mode": "perceptual"', "")
+    legacy = neural.NeuralRefinerConfig.from_json(legacy_json)
+    self.assertEqual(legacy.target_mode, "exact")
+
+  def test_expected_mode_mismatch_logs_warning(self):
+    cfg = neural.NeuralRefinerConfig(
+      dim=32, dilations=(1, 2), unet_base_dim=8, target_mode="exact"
+    )
+    model = neural.NapResidualRefiner(cfg)
+    params = model.init(
+      jax.random.PRNGKey(2),
+      jnp.zeros((1, 1024), dtype=jnp.float32),
+      jnp.zeros((1, 1024, cfg.n_coch_bins), dtype=jnp.float32),
+      jnp.zeros((1, 1024, cfg.n_coch_bins), dtype=jnp.float32),
+    )
+    mono_m = carfac.build(fs=16000)
+    t = np.arange(2048, dtype=np.float32) / 16000.0
+    tone = (0.01 * np.sin(2.0 * np.pi * 440.0 * t)).astype(np.float32)
+    nap = np.asarray(mono_m(jnp.asarray(tone[:, None]))[:, :, 0])
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      ckpt = pathlib.Path(tmp_dir) / "exact_only.npz"
+      neural.save_refiner_checkpoint(ckpt, params, cfg)
+      with self.assertLogs(level="WARNING") as logs:
+        out = neural.refine_waveform(
+          nap,
+          tone,
+          mono_m,
+          ckpt,
+          chunk_seconds=None,
+          expected_mode="perceptual",
+        )
+      self.assertEqual(out.shape, tone.shape)
+      self.assertTrue(
+        any("target_mode='exact'" in msg for msg in logs.output),
+        msg=f"Unexpected warning logs: {logs.output}",
+      )
 
   def test_zero_init_identity_silence_and_arbitrary_length(self):
     cfg = neural.NeuralRefinerConfig(dim=64, dilations=(1, 2), unet_base_dim=12)
@@ -181,6 +220,86 @@ class NeuralRefinerTest(absltest.TestCase):
       self.assertTrue(pathlib.Path(result.stage1_checkpoint_path).is_file())
       self.assertTrue(np.isfinite(result.best_stage1_val_loss))
       self.assertTrue(np.isfinite(result.best_stage2_val_loss))
+
+  def test_mini_training_perceptual_smoke(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      root = pathlib.Path(tmp_dir)
+      tr_p = root / "train_p.npz"
+      va_p = root / "val_p.npz"
+      ckpt_p = root / "perc.npz"
+      rng = np.random.default_rng(1)
+      t = np.arange(4096, dtype=np.float32) / 16000.0
+      sig = (0.01 * np.sin(2.0 * np.pi * 440.0 * t))[None, :].repeat(2, axis=0)
+      impaired = carfac.build(fs=16000, ohc_health=0.5)
+      healthy = carfac.build(fs=16000)
+      tgt_naps = np.asarray(
+        jax.vmap(lambda w: impaired(w[:, None])[:, :, 0])(jnp.asarray(sig)),
+        dtype=np.float32,
+      )
+      ws = sig * 0.6 + 0.0005 * rng.standard_normal(sig.shape).astype(
+        np.float32
+      )
+      np.savez(tr_p, target_naps=tgt_naps, ws_wavs=ws)
+      np.savez(va_p, target_naps=tgt_naps[:1], ws_wavs=ws[:1])
+
+      tiny_cfg = neural.NeuralRefinerConfig(
+        dim=32, dilations=(1, 2), unet_base_dim=8
+      )
+      # Oracle-NAP Stage 1 warmup followed by Stage 2 perceptual fine-tuning.
+      oracle_p = root / "oracle.npz"
+      oracle_ckpt_p = root / "oracle_s1.npz"
+      np.savez(oracle_p, target_wavs=sig, target_naps=tgt_naps, ws_wavs=ws)
+      s1_res = train_neural_refiner.run_training(
+        train_cache=str(oracle_p),
+        val_cache=str(oracle_p),
+        output_checkpoint=str(oracle_ckpt_p),
+        objective="exact",
+        stage1_steps=1,
+        stage2_steps=0,
+        batch_size=2,
+        eval_every=1,
+        model_config=tiny_cfg,
+      )
+      self.assertTrue(pathlib.Path(s1_res.stage1_checkpoint_path).is_file())
+
+      result = train_neural_refiner.run_training(
+        train_cache=str(tr_p),
+        val_cache=str(va_p),
+        output_checkpoint=str(ckpt_p),
+        objective="perceptual",
+        init_checkpoint=str(s1_res.stage1_checkpoint_path),
+        perceptual_steps=2,
+        perceptual_batch_size=2,
+        eval_every=1,
+        model_config=tiny_cfg,
+      )
+      self.assertTrue(ckpt_p.is_file())
+      self.assertTrue(np.isfinite(result.best_stage2_val_loss))
+      self.assertTrue(np.isfinite(result.best_val_nap_corr))
+      _, _, loaded_cfg = neural.load_refiner_checkpoint(ckpt_p)
+      self.assertEqual(loaded_cfg.target_mode, "perceptual")
+
+      res = inversion.invert_nap(
+        tgt_naps[0],
+        healthy,
+        inversion.InversionConfig(
+          mode="perceptual",
+          adam_steps=0,
+          lbfgs_steps=0,
+          chunk_seconds=None,
+          neural_checkpoint=str(ckpt_p),
+        ),
+      )
+      self.assertEqual(res.waveform.shape, (4096,))
+      self.assertTrue(np.all(np.isfinite(res.waveform)))
+
+      with self.assertRaisesRegex(ValueError, "Unsupported objective"):
+        train_neural_refiner.run_training(
+          train_cache=str(tr_p),
+          val_cache=str(va_p),
+          output_checkpoint=str(ckpt_p),
+          objective="invalid",
+        )
 
 
 if __name__ == "__main__":

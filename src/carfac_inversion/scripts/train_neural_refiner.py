@@ -24,7 +24,9 @@ from absl import flags
 from hp_acoustic import audio_constants
 from hp_acoustic.losses import waveform_losses
 from hp_acoustic.models import carfac
+from hp_acoustic.models import sai
 
+from carfac_inversion import inversion
 from carfac_inversion import neural
 
 FLAGS = flags.FLAGS
@@ -32,14 +34,23 @@ FLAGS = flags.FLAGS
 _TRAIN_CACHE: flags.FlagHolder[str | None]
 _VAL_CACHE: flags.FlagHolder[str | None]
 _OUTPUT_CHECKPOINT: flags.FlagHolder[str | None]
+_OBJECTIVE: flags.FlagHolder[str]
+_INIT_CHECKPOINT: flags.FlagHolder[str | None]
 _STAGE1_STEPS: flags.FlagHolder[int]
 _STAGE2_STEPS: flags.FlagHolder[int]
+_PERCEPTUAL_STEPS: flags.FlagHolder[int]
 _BATCH_SIZE: flags.FlagHolder[int]
 _STAGE2_BATCH_SIZE: flags.FlagHolder[int]
+_PERCEPTUAL_BATCH_SIZE: flags.FlagHolder[int]
 _STAGE1_LR: flags.FlagHolder[float]
 _STAGE2_LR: flags.FlagHolder[float]
+_PERCEPTUAL_LR: flags.FlagHolder[float]
 _EVAL_EVERY: flags.FlagHolder[int]
 _CARFAC_WEIGHT: flags.FlagHolder[float]
+_PERCEPTUAL_NAP_WEIGHT: flags.FlagHolder[float]
+_SAI_FFT_LEN: flags.FlagHolder[int]
+_DRIFT_WEIGHT: flags.FlagHolder[float]
+_HF_DIFF_WEIGHT: flags.FlagHolder[float]
 _SEED: flags.FlagHolder[int]
 
 _MRSTFT_SPECS = (
@@ -65,6 +76,7 @@ class TrainingResult:
   stage1_checkpoint_path: str | None
   final_checkpoint_path: str
   history: tuple[dict[str, float], ...]
+  best_val_nap_corr: float = float("nan")
 
 
 def define_flags(flag_values: flags.FlagValues = FLAGS) -> None:
@@ -81,6 +93,15 @@ def define_flags(flag_values: flags.FlagValues = FLAGS) -> None:
   global _EVAL_EVERY
   global _CARFAC_WEIGHT
   global _SEED
+  global _OBJECTIVE
+  global _INIT_CHECKPOINT
+  global _PERCEPTUAL_STEPS
+  global _PERCEPTUAL_BATCH_SIZE
+  global _PERCEPTUAL_LR
+  global _PERCEPTUAL_NAP_WEIGHT
+  global _SAI_FFT_LEN
+  global _DRIFT_WEIGHT
+  global _HF_DIFF_WEIGHT
 
   _TRAIN_CACHE = flags.DEFINE_string(
     "train_cache",
@@ -155,6 +176,61 @@ def define_flags(flag_values: flags.FlagValues = FLAGS) -> None:
     "seed",
     0,
     "PRNG seed for initialization and batch sampling.",
+    flag_values=flag_values,
+  )
+  _OBJECTIVE = flags.DEFINE_enum(
+    "objective",
+    "exact",
+    ("exact", "perceptual"),
+    "Training objective: 'exact' (paired healthy) or 'perceptual' (self-supervised Phase 3b).",
+    flag_values=flag_values,
+  )
+  _INIT_CHECKPOINT = flags.DEFINE_string(
+    "init_checkpoint",
+    None,
+    "Optional checkpoint .npz used to initialize weights before perceptual fine-tuning.",
+    flag_values=flag_values,
+  )
+  _PERCEPTUAL_STEPS = flags.DEFINE_integer(
+    "perceptual_steps",
+    1500,
+    "Optimizer steps when --objective=perceptual.",
+    flag_values=flag_values,
+  )
+  _PERCEPTUAL_BATCH_SIZE = flags.DEFINE_integer(
+    "perceptual_batch_size",
+    4,
+    "Minibatch size when --objective=perceptual.",
+    flag_values=flag_values,
+  )
+  _PERCEPTUAL_LR = flags.DEFINE_float(
+    "perceptual_lr",
+    2e-4,
+    "Peak learning rate when --objective=perceptual.",
+    flag_values=flag_values,
+  )
+  _PERCEPTUAL_NAP_WEIGHT = flags.DEFINE_float(
+    "perceptual_nap_weight",
+    0.30,
+    "Weight on raw NAP MSE inside the Phase 3b perceptual cycle loss.",
+    flag_values=flag_values,
+  )
+  _SAI_FFT_LEN = flags.DEFINE_integer(
+    "sai_fft_len",
+    2048,
+    "SAI frame FFT length for --objective=perceptual.",
+    flag_values=flag_values,
+  )
+  _DRIFT_WEIGHT = flags.DEFINE_float(
+    "drift_weight",
+    0.5,
+    "Weight on sub-35 Hz infrasound drift penalty in --objective=perceptual.",
+    flag_values=flag_values,
+  )
+  _HF_DIFF_WEIGHT = flags.DEFINE_float(
+    "hf_diff_weight",
+    0.0,
+    "Optional high-frequency difference regularizer weight in --objective=perceptual.",
     flag_values=flag_values,
   )
 
@@ -302,6 +378,510 @@ def compute_refiner_losses(
   return total, metrics
 
 
+def _resolve_sai_fft_len(
+  num_samples: int, requested_fft_len: int
+) -> int | None:
+  """Selects a valid SAI FFT window <= ``num_samples``, or ``None`` if too short."""
+  fft_len = requested_fft_len
+  while fft_len >= 512 and num_samples < fft_len:
+    fft_len //= 2
+  return fft_len if num_samples >= fft_len >= 512 else None
+
+
+def compute_perceptual_refiner_losses(
+  pred: jnp.ndarray,
+  target_nap_raw: jnp.ndarray,
+  *,
+  cochlea_model: carfac.CarfacCochleaModel,
+  rest_nap_raw: jnp.ndarray,
+  sample_rate_hz: int = 16000,
+  perceptual_nap_weight: float = 0.30,
+  sai_fft_len: int = 2048,
+  drift_weight: float = 0.5,
+  hf_diff_weight: float = 0.0,
+  ch_scale_rel_floor: float = 0.03,
+  sample_weights: jnp.ndarray | None = None,
+) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
+  """Self-supervised differentiable CARFAC perceptual cycle loss (Phase 3b).
+
+  Optimizes a healthy-cochlea forward synthesis ``pred`` directly against an
+  arbitrary (possibly impaired) target NAP on matching multi-scale cochlear
+  envelopes (2 ms & 8 ms), Stabilized Auditory Image (SAI) fine timing, and raw
+  NAP, without requiring a ground-truth reference waveform.
+  """
+  pred_nap = jax.vmap(lambda w: cochlea_model(w[:, None])[:, :, 0])(pred)
+  t_pos = jnp.maximum(target_nap_raw - rest_nap_raw[None, None, :], 0.0)
+  p_pos = jnp.maximum(pred_nap - rest_nap_raw[None, None, :], 0.0)
+
+  win_fast = max(1, int(round(0.002 * sample_rate_hz)))
+  win_slow = max(1, int(round(0.008 * sample_rate_hz)))
+  t_ef = jax.vmap(
+    lambda x: inversion._smooth_time_boxcar(x[:, :, None], win_fast)[:, :, 0]
+  )(t_pos)
+  t_es = jax.vmap(
+    lambda x: inversion._smooth_time_boxcar(x[:, :, None], win_slow)[:, :, 0]
+  )(t_pos)
+  p_ef = jax.vmap(
+    lambda x: inversion._smooth_time_boxcar(x[:, :, None], win_fast)[:, :, 0]
+  )(p_pos)
+  p_es = jax.vmap(
+    lambda x: inversion._smooth_time_boxcar(x[:, :, None], win_slow)[:, :, 0]
+  )(p_pos)
+
+  env_var = jnp.maximum(
+    jnp.var(t_ef, axis=(1, 2)) + jnp.var(t_es, axis=(1, 2)), 1e-12
+  )
+  nap_var = jnp.maximum(jnp.var(target_nap_raw, axis=(1, 2)), 1e-12)
+  raw_ch = jnp.sqrt(
+    jnp.mean(t_ef**2, axis=1, keepdims=True)
+    + jnp.mean(t_es**2, axis=1, keepdims=True)
+  )
+  # Floor weak high-CF channels relative to peak channel energy so silent or
+  # synaptopathic (resting-shifted) HF channels do not dominate gradients.
+  ch_floor = jnp.maximum(
+    1e-4, ch_scale_rel_floor * jnp.max(raw_ch, axis=2, keepdims=True)
+  )
+  ch_scale = jnp.maximum(raw_ch, ch_floor)
+
+  g_env = (
+    jnp.mean((p_ef - t_ef) ** 2, axis=(1, 2))
+    + jnp.mean((p_es - t_es) ** 2, axis=(1, 2))
+  ) / (2.0 * env_var)
+  c_env = 0.5 * (
+    jnp.mean(((p_ef - t_ef) / ch_scale) ** 2, axis=(1, 2))
+    + jnp.mean(((p_es - t_es) / ch_scale) ** 2, axis=(1, 2))
+  )
+  env_per_ex = 0.70 * g_env + 0.30 * c_env
+  nap_per_ex = jnp.mean((pred_nap - target_nap_raw) ** 2, axis=(1, 2)) / nap_var
+
+  eff_fft = _resolve_sai_fft_len(pred_nap.shape[1], sai_fft_len)
+  if eff_fft is not None:
+    sai_h = sai.SaiHypers(fft_len=eff_fft)
+    t_sai = jax.vmap(lambda x: sai.from_naps(x[None, :, :], sai_h))(
+      target_nap_raw
+    )
+    p_sai = jax.vmap(lambda x: sai.from_naps(x[None, :, :], sai_h))(pred_nap)
+    sai_var = jnp.maximum(
+      jnp.var(t_sai, axis=tuple(range(1, t_sai.ndim))), 1e-12
+    )
+    sai_per_ex = (
+      jnp.mean((p_sai - t_sai) ** 2, axis=tuple(range(1, p_sai.ndim))) / sai_var
+    )
+    remaining = max(0.0, 1.0 - perceptual_nap_weight)
+    env_w = remaining * (0.65 / 0.90)
+    sai_w = remaining * (0.25 / 0.90)
+    perc_per_ex = (
+      env_w * env_per_ex
+      + sai_w * sai_per_ex
+      + perceptual_nap_weight * nap_per_ex
+    )
+  else:
+    sai_per_ex = jnp.zeros_like(env_per_ex)
+    remaining = max(0.0, 1.0 - perceptual_nap_weight)
+    perc_per_ex = remaining * env_per_ex + perceptual_nap_weight * nap_per_ex
+
+  n_t = pred.shape[1]
+  freqs = jnp.fft.rfftfreq(n_t, d=1.0 / sample_rate_hz)
+  spec_pow = jnp.abs(jnp.fft.rfft(pred, axis=1)) ** 2
+  lf_mask = (freqs < 35.0).astype(jnp.float32)[None, :]
+  drift_per_ex = jnp.sum(spec_pow * lf_mask, axis=1) / (
+    jnp.sum(spec_pow, axis=1) + 1e-12
+  )
+  hf_diff_per_ex = jnp.mean((pred[:, 1:] - pred[:, :-1]) ** 2, axis=1) / (
+    jnp.mean(pred**2, axis=1) + 1e-12
+  )
+
+  p_flat = pred_nap.reshape((pred_nap.shape[0], -1))
+  t_flat = target_nap_raw.reshape((target_nap_raw.shape[0], -1))
+  p_c = p_flat - jnp.mean(p_flat, axis=1, keepdims=True)
+  t_c = t_flat - jnp.mean(t_flat, axis=1, keepdims=True)
+  nap_corr_per_ex = jnp.sum(p_c * t_c, axis=1) / jnp.sqrt(
+    jnp.maximum(jnp.sum(p_c**2, axis=1) * jnp.sum(t_c**2, axis=1), 1e-12)
+  )
+
+  if sample_weights is None:
+    w = jnp.full((pred.shape[0],), 1.0 / pred.shape[0], dtype=jnp.float32)
+  else:
+    w = sample_weights / jnp.maximum(jnp.sum(sample_weights), 1e-8)
+
+  def _wmean(x: jnp.ndarray) -> jnp.ndarray:
+    return jnp.sum(x * w)
+
+  perc_l = _wmean(perc_per_ex)
+  env_l = _wmean(env_per_ex)
+  sai_l = _wmean(sai_per_ex)
+  nap_l = _wmean(nap_per_ex)
+  drift_l = _wmean(drift_per_ex)
+  hf_diff_l = _wmean(hf_diff_per_ex)
+  nap_corr_m = _wmean(nap_corr_per_ex)
+  total = perc_l + drift_weight * drift_l + hf_diff_weight * hf_diff_l
+  metrics = {
+    "total": total,
+    "perc": perc_l,
+    "env": env_l,
+    "sai": sai_l,
+    "nap": nap_l,
+    "drift": drift_l,
+    "hf_diff": hf_diff_l,
+    "nap_corr": nap_corr_m,
+  }
+  return total, metrics
+
+
+def _batched_cochlea_run(
+  wavs: np.ndarray,
+  cochlea_model: carfac.CarfacCochleaModel,
+  batch_size: int = 16,
+) -> np.ndarray:
+  """Runs healthy CARFAC in fixed-size JIT chunks to avoid shape recompilation."""
+  jit_fn = jax.jit(jax.vmap(lambda x: cochlea_model(x[:, None])[:, :, 0]))
+  n_ex, t_len = wavs.shape
+  out = np.zeros((n_ex, t_len, cochlea_model.num_channels), dtype=np.float32)
+  for s in range(0, n_ex, batch_size):
+    e = min(n_ex, s + batch_size)
+    chunk = wavs[s:e]
+    if len(chunk) < batch_size:
+      padded = np.pad(chunk, ((0, batch_size - len(chunk)), (0, 0)))
+      res = np.asarray(jit_fn(jnp.asarray(padded)), dtype=np.float32)[
+        : len(chunk)
+      ]
+    else:
+      res = np.asarray(jit_fn(jnp.asarray(chunk)), dtype=np.float32)
+    out[s:e] = res
+  return out
+
+
+def _project_naps_canon(
+  raw_naps: np.ndarray,
+  proj_w: np.ndarray,
+  rest_nap: np.ndarray,
+  batch_size: int = 16,
+) -> np.ndarray:
+  """Projects raw cochlear NAPs to canonical log-compressed CF bins."""
+  proj_j = jnp.asarray(proj_w, dtype=jnp.float32)
+  rest_j = jnp.asarray(rest_nap, dtype=jnp.float32)
+  jit_proj = jax.jit(
+    lambda n: neural._compress_nap(
+      jnp.maximum(n - rest_j[None, None, :], 0.0) @ proj_j
+    )
+  )
+  n_ex, t_len, _ = raw_naps.shape
+  n_bins = proj_w.shape[1]
+  out = np.zeros((n_ex, t_len, n_bins), dtype=np.float32)
+  for s in range(0, n_ex, batch_size):
+    e = min(n_ex, s + batch_size)
+    out[s:e] = np.asarray(
+      jit_proj(jnp.asarray(raw_naps[s:e])), dtype=np.float32
+    )
+  return out
+
+
+def _load_perceptual_cache(
+  cache_path: str,
+  cochlea_model: carfac.CarfacCochleaModel,
+  proj_w: np.ndarray,
+  rest_nap: np.ndarray,
+  *,
+  batch_size: int = 16,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+  """Loads `(ws_wavs, canon_tgt_naps, canon_ws_naps, raw_tgt_naps)` from cache."""
+  with np.load(cache_path) as d:
+    ws_w = np.asarray(d["ws_wavs"], dtype=np.float32)
+    if "target_naps" in d:
+      raw_tgt = np.asarray(d["target_naps"], dtype=np.float32)
+      if raw_tgt.shape != (
+        ws_w.shape[0],
+        ws_w.shape[1],
+        cochlea_model.num_channels,
+      ):
+        raise ValueError(
+          f"Cache {cache_path} target_naps shape {raw_tgt.shape} does not match "
+          f"ws_wavs {ws_w.shape} x {cochlea_model.num_channels} channels."
+        )
+    elif "target_wavs" in d:
+      tgt_w = np.asarray(d["target_wavs"], dtype=np.float32)
+      raw_tgt = _batched_cochlea_run(
+        tgt_w, cochlea_model, batch_size=batch_size
+      )
+    else:
+      raise KeyError(
+        f"Cache {cache_path} must contain 'target_naps' or 'target_wavs'."
+      )
+
+  raw_ws = _batched_cochlea_run(ws_w, cochlea_model, batch_size=batch_size)
+  canon_tgt = _project_naps_canon(
+    raw_tgt, proj_w, rest_nap, batch_size=batch_size
+  )
+  canon_ws = _project_naps_canon(
+    raw_ws, proj_w, rest_nap, batch_size=batch_size
+  )
+  return ws_w, canon_tgt, canon_ws, raw_tgt
+
+
+def _evaluate_perceptual_split(
+  eval_batch_fn,
+  ws_wavs: np.ndarray,
+  canon_tgt_naps: np.ndarray,
+  canon_ws_naps: np.ndarray,
+  raw_tgt_naps: np.ndarray,
+  params: dict,
+  *,
+  batch_size: int = 4,
+) -> dict[str, float]:
+  """Evaluates perceptual validation metrics over fixed-shape padded batches."""
+  n_ex = len(ws_wavs)
+  sums: dict[str, float] = {}
+  total_weight = 0.0
+  for s in range(0, n_ex, batch_size):
+    e = min(n_ex, s + batch_size)
+    cnt = e - s
+    weights = np.zeros((batch_size,), dtype=np.float32)
+    weights[:cnt] = 1.0
+    if cnt < batch_size:
+      pad_idx = np.concatenate(
+        [np.arange(s, e), np.full((batch_size - cnt,), s)]
+      )
+    else:
+      pad_idx = np.arange(s, e)
+    metrics = eval_batch_fn(
+      params,
+      jnp.asarray(ws_wavs[pad_idx]),
+      jnp.asarray(canon_tgt_naps[pad_idx]),
+      jnp.asarray(canon_ws_naps[pad_idx]),
+      jnp.asarray(raw_tgt_naps[pad_idx]),
+      jnp.asarray(weights),
+    )
+    for k, v in metrics.items():
+      sums[k] = sums.get(k, 0.0) + float(v) * cnt
+    total_weight += cnt
+  return {k: v / max(1.0, total_weight) for k, v in sums.items()}
+
+
+def _run_perceptual_training(
+  *,
+  train_cache: str,
+  val_cache: str,
+  output_checkpoint: str,
+  init_checkpoint: str | None,
+  steps: int,
+  batch_size: int,
+  lr: float,
+  eval_every: int,
+  perceptual_nap_weight: float,
+  sai_fft_len: int,
+  drift_weight: float,
+  hf_diff_weight: float,
+  seed: int,
+  model_config: neural.NeuralRefinerConfig | None,
+) -> TrainingResult:
+  """Trains a Phase 3b refiner end-to-end under differentiable CARFAC perceptual loss."""
+  t0 = time.perf_counter()
+  init_params = None
+  if init_checkpoint is not None:
+    _, init_params, init_cfg = neural.load_refiner_checkpoint(init_checkpoint)
+    if model_config is not None:
+      arch_keys = (
+        "dim",
+        "dilations",
+        "n_coch_bins",
+        "cf_min_hz",
+        "cf_max_hz",
+        "n_fft",
+        "hop_length",
+        "unet_base_dim",
+        "sample_rate_hz",
+      )
+      for key in arch_keys:
+        if getattr(init_cfg, key) != getattr(model_config, key):
+          raise ValueError(
+            f"init_checkpoint {key}={getattr(init_cfg, key)!r} does not match "
+            f"model_config {key}={getattr(model_config, key)!r}."
+          )
+      base_cfg = model_config
+    else:
+      base_cfg = init_cfg
+  else:
+    base_cfg = (
+      neural.NeuralRefinerConfig() if model_config is None else model_config
+    )
+
+  cfg = dataclasses.replace(base_cfg, target_mode="perceptual")
+  model = neural.NapResidualRefiner(config=cfg)
+  fs = int(round(cfg.sample_rate_hz))
+  cochlea_model = carfac.build(fs=fs)
+
+  with np.load(train_cache) as d_tr:
+    t_len = int(d_tr["ws_wavs"].shape[1])
+  rest_nap = np.asarray(
+    cochlea_model(jnp.zeros((min(512, t_len), 1), dtype=jnp.float32))[-1, :, 0],
+    dtype=np.float32,
+  )
+  proj_w = neural.cochlea_cf_projection(cochlea_model, cfg)
+  rest_nap_j = jnp.asarray(rest_nap, dtype=jnp.float32)
+
+  print(
+    f"Loading Phase 3b perceptual caches ({fs} Hz, T={t_len})...", flush=True
+  )
+  tr_ws, tr_tgt_c, tr_ws_c, tr_raw_tgt = _load_perceptual_cache(
+    train_cache, cochlea_model, proj_w, rest_nap
+  )
+  va_ws, va_tgt_c, va_ws_c, va_raw_tgt = _load_perceptual_cache(
+    val_cache, cochlea_model, proj_w, rest_nap
+  )
+  n_train = len(tr_ws)
+  print(
+    f"Loaded {n_train} train, {len(va_ws)} val perceptual examples "
+    f"in {time.perf_counter() - t0:.1f}s.",
+    flush=True,
+  )
+
+  if init_params is None:
+    params = model.init(
+      jax.random.PRNGKey(seed),
+      jnp.zeros((1, t_len), dtype=jnp.float32),
+      jnp.zeros((1, t_len, cfg.n_coch_bins), dtype=jnp.float32),
+      jnp.zeros((1, t_len, cfg.n_coch_bins), dtype=jnp.float32),
+    )
+  else:
+    params = init_params
+
+  warmup = min(50, max(1, steps // 10))
+  schedule = optax.warmup_cosine_decay_schedule(
+    init_value=lr * 0.1,
+    peak_value=lr,
+    warmup_steps=warmup,
+    decay_steps=max(steps, warmup + 1),
+    end_value=lr * 0.05,
+  )
+  tx = optax.chain(
+    optax.clip_by_global_norm(2.0),
+    optax.adamw(learning_rate=schedule, weight_decay=1e-4),
+  )
+  opt_state = tx.init(params)
+
+  loss_kwargs = dict(
+    cochlea_model=cochlea_model,
+    rest_nap_raw=rest_nap_j,
+    sample_rate_hz=fs,
+    perceptual_nap_weight=perceptual_nap_weight,
+    sai_fft_len=sai_fft_len,
+    drift_weight=drift_weight,
+    hf_diff_weight=hf_diff_weight,
+  )
+
+  @jax.jit
+  def train_step(p, os, b_ws, b_tc, b_wc, b_rtgt):
+    def _loss_fn(pr):
+      pred = model.apply(pr, b_ws, b_tc, b_wc)
+      return compute_perceptual_refiner_losses(pred, b_rtgt, **loss_kwargs)
+
+    (val, metrics), grads = jax.value_and_grad(_loss_fn, has_aux=True)(p)
+    updates, new_os = tx.update(grads, os, p)
+    return optax.apply_updates(p, updates), new_os, val, metrics
+
+  @jax.jit
+  def eval_batch(p, b_ws, b_tc, b_wc, b_rtgt, b_weights):
+    pred = model.apply(p, b_ws, b_tc, b_wc)
+    _, metrics = compute_perceptual_refiner_losses(
+      pred, b_rtgt, sample_weights=b_weights, **loss_kwargs
+    )
+    return metrics
+
+  rng = np.random.default_rng(seed)
+  best_val_loss = float("inf")
+  best_val_nap_corr = -1.0
+  init_val_loss = 0.0
+  history: list[dict[str, float]] = []
+  out_path = pathlib.Path(output_checkpoint)
+
+  # Log step-0 baseline before any update, without overwriting best with unadapted exact weights.
+  val0 = _evaluate_perceptual_split(
+    eval_batch,
+    va_ws,
+    va_tgt_c,
+    va_ws_c,
+    va_raw_tgt,
+    params,
+    batch_size=batch_size,
+  )
+  init_val_loss = float(val0["total"])
+  print(
+    f"[Phase3b] init val loss={val0['total']:.4f} "
+    f"(perc={val0['perc']:.4f}, env={val0['env']:.4f}, sai={val0['sai']:.4f}, "
+    f"nap={val0['nap']:.4f}, nap_corr={val0['nap_corr']:.4f}, drift={val0['drift']:.4f})",
+    flush=True,
+  )
+  if steps == 0:
+    neural.save_refiner_checkpoint(out_path, params, cfg)
+    return TrainingResult(
+      best_stage1_val_loss=init_val_loss,
+      best_stage2_val_loss=init_val_loss,
+      best_stage1_sisdr_db=0.0,
+      best_stage2_sisdr_db=0.0,
+      stage1_checkpoint_path=init_checkpoint,
+      final_checkpoint_path=str(out_path),
+      history=(),
+      best_val_nap_corr=float(val0["nap_corr"]),
+    )
+
+  for step in range(1, steps + 1):
+    idx = rng.integers(0, n_train, size=batch_size)
+    params, opt_state, loss_val, m_tr = train_step(
+      params,
+      opt_state,
+      jnp.asarray(tr_ws[idx]),
+      jnp.asarray(tr_tgt_c[idx]),
+      jnp.asarray(tr_ws_c[idx]),
+      jnp.asarray(tr_raw_tgt[idx]),
+    )
+    if step % max(1, eval_every) == 0 or step == steps:
+      m_val = _evaluate_perceptual_split(
+        eval_batch,
+        va_ws,
+        va_tgt_c,
+        va_ws_c,
+        va_raw_tgt,
+        params,
+        batch_size=batch_size,
+      )
+      rec = {
+        "stage": 3.0,
+        "step": float(step),
+        "train_loss": float(loss_val),
+        "train_nap_corr": float(m_tr["nap_corr"]),
+        "val_loss": float(m_val["total"]),
+        "val_perc": float(m_val["perc"]),
+        "val_env": float(m_val["env"]),
+        "val_sai": float(m_val["sai"]),
+        "val_nap": float(m_val["nap"]),
+        "val_drift": float(m_val["drift"]),
+        "val_nap_corr": float(m_val["nap_corr"]),
+      }
+      history.append(rec)
+      if m_val["total"] < best_val_loss:
+        best_val_loss = float(m_val["total"])
+        best_val_nap_corr = float(m_val["nap_corr"])
+        neural.save_refiner_checkpoint(out_path, params, cfg)
+      print(
+        f"[Phase3b] step {step:4d}/{steps} | train={float(loss_val):.4f} "
+        f"| val={m_val['total']:.4f} (env={m_val['env']:.4f}, sai={m_val['sai']:.4f}, "
+        f"nap={m_val['nap']:.4f}, drift={m_val['drift']:.4f}, nap_corr={m_val['nap_corr']:.4f}) "
+        f"| best={best_val_loss:.4f} | t={time.perf_counter() - t0:.1f}s",
+        flush=True,
+      )
+
+  return TrainingResult(
+    best_stage1_val_loss=init_val_loss,
+    best_stage2_val_loss=best_val_loss,
+    best_stage1_sisdr_db=0.0,
+    best_stage2_sisdr_db=0.0,
+    stage1_checkpoint_path=init_checkpoint,
+    final_checkpoint_path=str(out_path),
+    history=tuple(history),
+    best_val_nap_corr=best_val_nap_corr,
+  )
+
+
 def _precompute_cochlear_features(
   target_wavs: np.ndarray,
   ws_wavs: np.ndarray,
@@ -404,8 +984,38 @@ def run_training(
   carfac_weight: float = 15.0,
   seed: int = 0,
   model_config: neural.NeuralRefinerConfig | None = None,
+  objective: str = "exact",
+  init_checkpoint: str | None = None,
+  perceptual_steps: int = 1500,
+  perceptual_batch_size: int = 4,
+  perceptual_lr: float = 2e-4,
+  perceptual_nap_weight: float = 0.30,
+  sai_fft_len: int = 2048,
+  drift_weight: float = 0.5,
+  hf_diff_weight: float = 0.0,
 ) -> TrainingResult:
-  """Trains a Phase 3 :class:`NapResidualRefiner` in two stages."""
+  """Trains a Phase 3 (`exact`) or Phase 3b (`perceptual`) residual refiner."""
+  if objective == "perceptual":
+    return _run_perceptual_training(
+      train_cache=train_cache,
+      val_cache=val_cache,
+      output_checkpoint=output_checkpoint,
+      init_checkpoint=init_checkpoint,
+      steps=perceptual_steps,
+      batch_size=perceptual_batch_size,
+      lr=perceptual_lr,
+      eval_every=eval_every,
+      perceptual_nap_weight=perceptual_nap_weight,
+      sai_fft_len=sai_fft_len,
+      drift_weight=drift_weight,
+      hf_diff_weight=hf_diff_weight,
+      seed=seed,
+      model_config=model_config,
+    )
+  if objective != "exact":
+    raise ValueError(
+      f"Unsupported objective {objective!r}; expected 'exact' or 'perceptual'."
+    )
   t0 = time.perf_counter()
   cfg = neural.NeuralRefinerConfig() if model_config is None else model_config
   model = neural.NapResidualRefiner(config=cfg)
@@ -415,9 +1025,11 @@ def run_training(
   with np.load(train_cache) as d_tr:
     tr_tgt_w = np.asarray(d_tr["target_wavs"], dtype=np.float32)
     tr_ws_w = np.asarray(d_tr["ws_wavs"], dtype=np.float32)
+    tr_has_naps = "target_naps" in d_tr
   with np.load(val_cache) as d_va:
     va_tgt_w = np.asarray(d_va["target_wavs"], dtype=np.float32)
     va_ws_w = np.asarray(d_va["ws_wavs"], dtype=np.float32)
+    va_has_naps = "target_naps" in d_va
 
   n_train, t_len = tr_tgt_w.shape
   rest_nap = np.asarray(
@@ -433,12 +1045,22 @@ def run_training(
   print(
     f"Precomputing cochlear features ({n_train} train, {len(va_tgt_w)} val)..."
   )
-  tr_raw_nap, tr_can_tgt, tr_can_ws = _precompute_cochlear_features(
-    tr_tgt_w, tr_ws_w, fixed_cochlea, proj_w, rest_nap
-  )
-  va_raw_nap, va_can_tgt, va_can_ws = _precompute_cochlear_features(
-    va_tgt_w, va_ws_w, fixed_cochlea, proj_w, rest_nap
-  )
+  if tr_has_naps:
+    _, tr_can_tgt, tr_can_ws, tr_raw_nap = _load_perceptual_cache(
+      train_cache, fixed_cochlea, proj_w, rest_nap
+    )
+  else:
+    tr_raw_nap, tr_can_tgt, tr_can_ws = _precompute_cochlear_features(
+      tr_tgt_w, tr_ws_w, fixed_cochlea, proj_w, rest_nap
+    )
+  if va_has_naps:
+    _, va_can_tgt, va_can_ws, va_raw_nap = _load_perceptual_cache(
+      val_cache, fixed_cochlea, proj_w, rest_nap
+    )
+  else:
+    va_raw_nap, va_can_tgt, va_can_ws = _precompute_cochlear_features(
+      va_tgt_w, va_ws_w, fixed_cochlea, proj_w, rest_nap
+    )
   print(f"Feature precompute done in {time.perf_counter() - t0:.1f}s")
 
   rng = jax.random.PRNGKey(seed)
@@ -699,6 +1321,15 @@ def main(argv: Sequence[str]) -> None:
     eval_every=_EVAL_EVERY.value,
     carfac_weight=_CARFAC_WEIGHT.value,
     seed=_SEED.value,
+    objective=_OBJECTIVE.value,
+    init_checkpoint=_INIT_CHECKPOINT.value,
+    perceptual_steps=_PERCEPTUAL_STEPS.value,
+    perceptual_batch_size=_PERCEPTUAL_BATCH_SIZE.value,
+    perceptual_lr=_PERCEPTUAL_LR.value,
+    perceptual_nap_weight=_PERCEPTUAL_NAP_WEIGHT.value,
+    sai_fft_len=_SAI_FFT_LEN.value,
+    drift_weight=_DRIFT_WEIGHT.value,
+    hf_diff_weight=_HF_DIFF_WEIGHT.value,
   )
 
 

@@ -1432,6 +1432,7 @@ def invert_nap(
       cfg.neural_checkpoint,
       chunk_seconds=cfg.chunk_seconds,
       chunk_overlap_s=cfg.chunk_overlap_s,
+      expected_mode=cfg.mode,
     )
 
   is_pytree = not jax.tree_util.treedef_is_leaf(

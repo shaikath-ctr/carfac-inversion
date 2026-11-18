@@ -4,6 +4,7 @@ import csv
 import pathlib
 import tempfile
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from absl.testing import absltest
@@ -12,6 +13,7 @@ from hp_acoustic.data import records
 from hp_acoustic.io import audio_io
 from hp_acoustic.metrics import sii
 
+from carfac_inversion import neural
 from carfac_inversion.scripts import benchmark_suite
 
 
@@ -110,6 +112,43 @@ class BenchmarkSuiteTest(absltest.TestCase):
     np.testing.assert_array_equal(
       benchmark_suite._scale_to_spl(zeros, 65.0), zeros
     )
+
+  def test_run_benchmark_routes_perceptual_neural_checkpoint(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      root = pathlib.Path(tmp_dir)
+      exact_ckpt = root / "exact.npz"
+      perc_ckpt = root / "perc.npz"
+      for path, mode in ((exact_ckpt, "exact"), (perc_ckpt, "perceptual")):
+        cfg = neural.NeuralRefinerConfig(
+          dim=32, dilations=(1, 2), unet_base_dim=8, target_mode=mode
+        )
+        model = neural.NapResidualRefiner(cfg)
+        params = model.init(
+          jax.random.PRNGKey(0),
+          jnp.zeros((1, 1024), dtype=jnp.float32),
+          jnp.zeros((1, 1024, cfg.n_coch_bins), dtype=jnp.float32),
+          jnp.zeros((1, 1024, cfg.n_coch_bins), dtype=jnp.float32),
+        )
+        neural.save_refiner_checkpoint(path, params, cfg)
+
+      with self.assertNoLogs(level="WARNING"):
+        rows = benchmark_suite.run_benchmark(
+          input_dir=None,
+          output_dir=str(root / "out"),
+          max_clips=1,
+          clip_seconds=0.15,
+          sample_rates=(16000,),
+          levels_db_spl=(65.0,),
+          snrs_db=(10.0,),
+          step_budgets=((0, 0),),
+          chunk_seconds=None,
+          neural_checkpoint=str(exact_ckpt),
+          perceptual_neural_checkpoint=str(perc_ckpt),
+          seed=0,
+        )
+      scenarios = {r["scenario"] for r in rows}
+      self.assertIn("auralization", scenarios)
+      self.assertIn("roundtrip", scenarios)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ tail.
 import dataclasses
 import functools
 import json
+import logging
 import math
 import pathlib
 from collections.abc import Sequence
@@ -60,6 +61,7 @@ class NeuralRefinerConfig:
   sample_rate_hz: float = 16000.0
   max_log_gain_down: float = -2.0
   max_log_gain_up: float = 2.5
+  target_mode: str = "exact"
 
   def to_json(self) -> str:
     """Serializes the configuration to a JSON string."""
@@ -480,6 +482,7 @@ def refine_waveform(
   *,
   chunk_seconds: float | None = 1.5,
   chunk_overlap_s: float = 0.128,
+  expected_mode: str | None = None,
 ) -> np.ndarray:
   """Applies a trained Phase 3 neural residual refiner to ``warm_start``.
 
@@ -494,11 +497,21 @@ def refine_waveform(
     chunk_seconds: Optional fixed OLA window length in seconds so XLA compiles
       once for arbitrary-duration clips.
     chunk_overlap_s: Cosine-squared overlap blend duration in seconds.
+    expected_mode: Optional inversion mode (``"exact"`` or ``"perceptual"``);
+      logs a warning if the checkpoint's ``target_mode`` differs.
 
   Returns:
     Refined waveform matching ``warm_start`` shape in ``float32``.
   """
   model, params, config = load_refiner_checkpoint(checkpoint_path)
+  if expected_mode is not None and config.target_mode != expected_mode:
+    logging.warning(
+      "Neural checkpoint %s has target_mode=%r, but inversion is running "
+      "with mode=%r; predictions may misalign with the target objective.",
+      checkpoint_path,
+      config.target_mode,
+      expected_mode,
+    )
 
   ws_np = np.asarray(warm_start, dtype=np.float32)
   is_1d = ws_np.ndim == 1
