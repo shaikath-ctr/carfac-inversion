@@ -229,6 +229,8 @@ recorded with accepted/rejected ablations in
 
 ## Evaluation Results
 
+![Phase 2 vs. Phase 3 Across 4 Unseen LibriSpeech Speakers](docs/phase_progression.png)
+
 Headline metrics on **4 held-out LibriSpeech speakers** (`[7850, 7976, 8297, 8842]`, `16 kHz`, `1.0 s` windows; 100% unseen during neural training, calibrated under `sii.CARFAC_RMS_ONE_DB_SPL ≈ 107.01 dB SPL`):
 
 | Condition | Method | Runtime | SI-SDR | STOI | HASPI | HASQI / nl | 4.5–7.5 kHz SNR |

@@ -26,6 +26,7 @@ wheels/
 *.npy
 *.npz
 *.png
+!docs/*.png
 output/
 tmp/
 runs/
