@@ -12,6 +12,7 @@ from hp_acoustic.audiology import impaired_cochlea
 from hp_acoustic.io import audio_io
 from hp_acoustic.metrics import context as metric_context
 from hp_acoustic.metrics import perceptual
+from hp_acoustic.metrics import sii
 from hp_acoustic.metrics import waveform as waveform_metrics
 from hp_acoustic.models import carfac
 
@@ -69,7 +70,8 @@ def define_flags(flag_values: flags.FlagValues = FLAGS) -> None:
   _LEVEL_DB_SPL = flags.DEFINE_float(
     "level_db_spl",
     None,
-    "Optional RMS calibration level in dB SPL (0 dBFS = 104 dB SPL).",
+    "Optional RMS calibration level in dB SPL (full-scale sine peak = 104 dB "
+    "SPL; RMS=1.0 ~ 107.01 dB SPL).",
     flag_values=flag_values,
   )
   _SOURCE_OHC_HEALTH = flags.DEFINE_float(
@@ -143,9 +145,7 @@ def run_invert_wav(
   if level_db_spl is not None:
     rms = float(np.sqrt(np.mean(audio**2)))
     if rms > 0.0:
-      target_rms = 10.0 ** (
-        (level_db_spl - audio_constants.DYNAMIC_RANGE_DB) / 20.0
-      )
+      target_rms = 10.0 ** ((level_db_spl - sii.CARFAC_RMS_ONE_DB_SPL) / 20.0)
       audio = (audio * (target_rms / rms)).astype(np.float32)
 
   target_cochlea = carfac.build(fs=sample_rate_hz)

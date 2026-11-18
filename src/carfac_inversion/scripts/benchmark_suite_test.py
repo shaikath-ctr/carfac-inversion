@@ -10,6 +10,7 @@ from absl.testing import absltest
 from hp_acoustic.data import clips as clip_types
 from hp_acoustic.data import records
 from hp_acoustic.io import audio_io
+from hp_acoustic.metrics import sii
 
 from carfac_inversion.scripts import benchmark_suite
 
@@ -96,6 +97,19 @@ class BenchmarkSuiteTest(absltest.TestCase):
         self.assertTrue(np.all(np.isfinite(out)))
     with self.assertRaisesRegex(ValueError, "Unsupported enhancer"):
       benchmark_suite._run_optional_enhancer("unknown", noisy, 16000)
+
+  def test_scale_to_spl_uses_carfac_rms_one_convention(self):
+    t = np.arange(1600, dtype=np.float32) / 16000.0
+    sine = np.sin(2.0 * np.pi * 500.0 * t).astype(np.float32)
+    scaled = benchmark_suite._scale_to_spl(sine, 65.0)
+    expected_rms = 10.0 ** ((65.0 - sii.CARFAC_RMS_ONE_DB_SPL) / 20.0)
+    self.assertAlmostEqual(
+      float(np.sqrt(np.mean(scaled**2))), expected_rms, delta=1e-6
+    )
+    zeros = np.zeros(128, dtype=np.float32)
+    np.testing.assert_array_equal(
+      benchmark_suite._scale_to_spl(zeros, 65.0), zeros
+    )
 
 
 if __name__ == "__main__":

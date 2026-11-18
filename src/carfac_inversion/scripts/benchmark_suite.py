@@ -26,13 +26,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 from absl import app
 from absl import flags
-from hp_acoustic import audio_constants
 from hp_acoustic.data import records
 from hp_acoustic.data import transforms
 from hp_acoustic.io import audio_io
 from hp_acoustic.io import resampling
 from hp_acoustic.metrics import context as metric_context
 from hp_acoustic.metrics import perceptual
+from hp_acoustic.metrics import sii
 from hp_acoustic.metrics import waveform as waveform_metrics
 from hp_acoustic.models import carfac
 from hp_acoustic.models import sai as sai_lib
@@ -280,9 +280,7 @@ def _scale_to_spl(audio: np.ndarray, level_db_spl: float) -> np.ndarray:
   rms = float(np.sqrt(np.mean(audio**2)))
   if rms <= 1e-12:
     return audio.astype(np.float32)
-  target_rms = 10.0 ** (
-    (level_db_spl - audio_constants.DYNAMIC_RANGE_DB) / 20.0
-  )
+  target_rms = 10.0 ** ((level_db_spl - sii.CARFAC_RMS_ONE_DB_SPL) / 20.0)
   return (audio * (target_rms / rms)).astype(np.float32)
 
 
@@ -404,14 +402,13 @@ def _score_pair(
     pass
   if np.any(ctx.reference):
     try:
-      lvl = audio_constants.DYNAMIC_RANGE_DB + 20.0 * math.log10(math.sqrt(2.0))
       q, nl, lin, _ = hasqi_lib.hasqi_v2(
         ref_c,
         sample_rate_hz,
         est_c,
         sample_rate_hz,
         hearing_loss_db,
-        level1=lvl,
+        level1=sii.CARFAC_RMS_ONE_DB_SPL,
       )
       hasqi_nl = float(nl)
       hasqi_lin = float(lin)

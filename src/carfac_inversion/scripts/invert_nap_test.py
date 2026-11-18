@@ -6,6 +6,7 @@ import tempfile
 import numpy as np
 from absl.testing import absltest
 from hp_acoustic.io import audio_io
+from hp_acoustic.metrics import sii
 from hp_acoustic.models import carfac
 
 from carfac_inversion.scripts import invert_nap
@@ -72,6 +73,26 @@ class InvertNapScriptTest(absltest.TestCase):
       )
       self.assertTrue(out_wav.is_file())
       self.assertTrue(np.all(np.isfinite(result.waveform)))
+
+  def test_level_calibration_uses_rms_one_convention(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      in_wav = pathlib.Path(tmp_dir) / "in.wav"
+      out_wav = pathlib.Path(tmp_dir) / "out.wav"
+      self._write_test_wav(in_wav, fs=16000)
+
+      result = invert_nap.run_invert_wav(
+        input_wav=str(in_wav),
+        output_wav=str(out_wav),
+        sample_rate_hz=16000,
+        level_db_spl=50.0,
+        adam_steps=0,
+        lbfgs_steps=0,
+      )
+      expected_rms = 10.0 ** ((50.0 - sii.CARFAC_RMS_ONE_DB_SPL) / 20.0)
+      old_104_rms = 10.0 ** ((50.0 - 104.0) / 20.0)
+      ws_rms = float(np.sqrt(np.mean(result.warm_start**2)))
+      self.assertAlmostEqual(ws_rms, expected_rms, delta=0.25 * expected_rms)
+      self.assertLess(abs(ws_rms - expected_rms), abs(ws_rms - old_104_rms))
 
 
 if __name__ == "__main__":

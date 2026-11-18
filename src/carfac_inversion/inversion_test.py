@@ -8,6 +8,7 @@ from carfac.jax import carfac as carfac_jax
 from hp_acoustic.filters import middle_ear
 from hp_acoustic.metrics import context as metric_context
 from hp_acoustic.metrics import perceptual
+from hp_acoustic.metrics import sii
 from hp_acoustic.metrics import waveform as waveform_metrics
 from hp_acoustic.models import carfac
 from hp_acoustic.models import cochlea
@@ -58,7 +59,7 @@ def _make_speech_like_signal(
   sig[:ramp] *= taper
   sig[-ramp:] *= taper[::-1]
 
-  target_rms = 10.0 ** ((level_db_spl - 104.0) / 20.0)
+  target_rms = 10.0 ** ((level_db_spl - sii.CARFAC_RMS_ONE_DB_SPL) / 20.0)
   sig *= target_rms / (np.sqrt(np.mean(sig**2)) + 1e-12)
   return sig.astype(np.float32)
 
@@ -403,7 +404,7 @@ class CarfacInversionTest(parameterized.TestCase):
     taper = np.sin(0.5 * np.pi * np.arange(ramp) / ramp) ** 2
     sig[:ramp] *= taper
     sig[-ramp:] *= taper[::-1]
-    sig *= (10.0 ** ((55.0 - 104.0) / 20.0)) / (
+    sig *= (10.0 ** ((55.0 - sii.CARFAC_RMS_ONE_DB_SPL) / 20.0)) / (
       np.sqrt(np.mean(sig**2)) + 1e-12
     )
     sig_f32 = sig.astype(np.float32)
@@ -434,6 +435,55 @@ class CarfacInversionTest(parameterized.TestCase):
     result = inversion.invert_nap(nap, self.healthy, cfg)
     self.assertEmpty(result.loss_history)
     self.assertGreater(float(np.std(result.waveform)), 1e-4)
+
+  def test_per_ear_ohc_scale_and_retuned_low_spl_calibration(self):
+    # Verify per-ear and per-channel ohc_scale broadcasting in BM IR measurement.
+    params2 = carfac_jax.CarfacDesignParameters.with_n_ears(2, fs=16000)
+    params2.ears[0].ihc.ihc_style = "two_cap_with_syn"
+    params2.ears[1].ihc.ihc_style = "two_cap_with_syn"
+    h2, w2, s2 = carfac_jax.design_and_init_carfac(params2)
+    model_2ear = carfac.CarfacCochleaModel(
+      hypers=h2, weights=w2, initial_state=s2, fs=16000.0
+    )
+    irs_vec = inversion._measure_carfac_bm_irs(
+      model_2ear, ir_len=256, ohc_scale=np.array([1.0, 0.55])
+    )
+    irs_ear0 = inversion._measure_carfac_bm_irs(
+      model_2ear, ir_len=256, ohc_scale=1.0
+    )
+    irs_ear1 = inversion._measure_carfac_bm_irs(
+      model_2ear, ir_len=256, ohc_scale=0.55
+    )
+    np.testing.assert_allclose(irs_vec[:, :, 0], irs_ear0[:, :, 0], rtol=1e-6)
+    np.testing.assert_allclose(irs_vec[:, :, 1], irs_ear1[:, :, 1], rtol=1e-6)
+
+    # Verify adaptive scalar gain bounds for high-gain CARFAC presets (Option C,
+    # Cal_rms1 ~ 124.2 dB SPL) at 20 dB SPL (~6.17e-6 RMS, below 5e-5 Baseline floor).
+    params_c = carfac_jax.CarfacDesignParameters(fs=16000.0)
+    params_c.ears[0].ihc.ihc_style = "two_cap_with_syn"
+    params_c.ears[0].car.use_delay_buffer = True
+    params_c.ears[0].car.min_zeta = 0.07
+    params_c.ears[0].car.max_zeta = 0.35
+    params_c.ears[0].car.erb_per_step = 0.35
+    params_c.ears[0].car.zero_ratio = 1.300
+    hc, wc, sc = carfac_jax.design_and_init_carfac(params_c)
+    model_c = carfac.CarfacCochleaModel(
+      hypers=hc, weights=wc, initial_state=sc, fs=16000.0
+    )
+    true_rms = 10.0 ** ((20.0 - 124.2) / 20.0)
+    sig = _make_speech_like_signal(sample_rate_hz=16000, duration_s=0.4)
+    sig = (sig * (true_rms / float(np.sqrt(np.mean(sig**2))))).astype(
+      np.float32
+    )
+    nap = np.asarray(model_c(jnp.asarray(sig[:, None]))[:, :, 0])
+    ws = inversion.dsp_warm_start(nap, model_c)
+    ws_rms = float(np.sqrt(np.mean(ws**2)))
+    self.assertGreater(ws_rms, true_rms * 0.5)
+    self.assertLess(ws_rms, true_rms * 1.6)
+    nap_ws = np.asarray(model_c(jnp.asarray(ws[:, None]))[:, :, 0])
+    self.assertGreater(
+      float(np.corrcoef(nap_ws.ravel(), nap.ravel())[0, 1]), 0.90
+    )
 
 
 if __name__ == "__main__":

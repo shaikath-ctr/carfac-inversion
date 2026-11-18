@@ -247,7 +247,7 @@ def _normalize_target_nap(
 def _measure_carfac_bm_irs(
   cochlea_model: carfac.CarfacCochleaModel,
   ir_len: int,
-  ohc_scale: float = 1.0,
+  ohc_scale: float | np.ndarray = 1.0,
 ) -> np.ndarray:
   """Measures open-loop CARFAC basilar-membrane impulse responses."""
   num_ears = len(cochlea_model.hypers.ears)
@@ -256,12 +256,19 @@ def _measure_carfac_bm_irs(
   w = conductive.apply(imp, cochlea_model.conductive_filter)
   w = middle_ear.apply(w, cochlea_model.middle_ear_filter)
 
+  scale_arr = np.asarray(ohc_scale, dtype=np.float32)
   state_ears = []
   for ear_idx in range(num_ears):
     ear_hypers = cochlea_model.hypers.ears[ear_idx]
     ear_weights = cochlea_model.weights.ears[ear_idx]
     ear_state = cochlea_model.initial_state.ears[ear_idx]
-    undamping = ear_weights.car.ohc_health * ohc_scale
+    if scale_arr.ndim == 0:
+      ear_scale: float | jnp.ndarray = float(scale_arr)
+    elif scale_arr.ndim == 1:
+      ear_scale = float(scale_arr[ear_idx])
+    else:
+      ear_scale = jnp.asarray(scale_arr[:, ear_idx], dtype=jnp.float32)
+    undamping = ear_weights.car.ohc_health * ear_scale
     zb = ear_hypers.car.zr_coeffs * undamping
     g = carfac_jax.stage_g(ear_weights.car, undamping)
     car_state = dataclasses.replace(ear_state.car, zb_memory=zb, g_memory=g)
@@ -330,6 +337,7 @@ def _calibrate_scalar_gain(
   rest_nap_j: jnp.ndarray,
   cochlea_model: cochlea.CochleaModel,
   center_rms: float | None = None,
+  reference_rms: float | None = None,
 ) -> float:
   """Finds the scalar gain minimizing per-channel positive NAP RMS mismatch."""
   target_ch_rms = jnp.sqrt(
@@ -355,12 +363,25 @@ def _calibrate_scalar_gain(
 
   if center_rms is None:
     coarse = np.geomspace(5e-5, 0.4, 14)
+    # Extend the coarse bracket when linear deconvolution indicates a quiet
+    # signal or a retuned high-gain/attenuated cochlea outside Baseline bounds.
+    if reference_rms is not None and reference_rms > 0.0:
+      if reference_rms < 1e-3:
+        lo_ext = max(1e-7, reference_rms * 0.02)
+        if lo_ext < 5e-5:
+          coarse = np.concatenate(
+            [np.geomspace(lo_ext, 5e-5, 5, endpoint=False), coarse]
+          )
+      if reference_rms > 0.05:
+        hi_ext = min(2.0, reference_rms * 10.0)
+        if hi_ext > 0.4:
+          coarse = np.concatenate([coarse, np.geomspace(0.4, hi_ext, 4)[1:]])
     best_gain = float(
       coarse[int(np.argmin([eval_err(float(g)) for g in coarse]))]
     )
     fine = np.geomspace(best_gain * 0.65, best_gain * 1.55, 7)
   else:
-    fine = np.geomspace(max(center_rms * 0.5, 1e-6), center_rms * 2.0, 7)
+    fine = np.geomspace(max(center_rms * 0.5, 1e-8), center_rms * 2.0, 7)
   return float(fine[int(np.argmin([eval_err(float(g)) for g in fine]))])
 
 
@@ -376,12 +397,20 @@ def _carfac_dsp_warm_start(
   cfs = np.asarray(cochlea_model.channel_frequencies, dtype=np.float64)
   nap_c = nap_3d.astype(np.float64) - rest_nap[None, :, :]
 
-  # Estimate AGC-damped proxy OHC scale from overall NAP drive.
-  nap_rms = float(np.sqrt(np.mean(nap_c**2)))
-  ohc_scale = min(1.0, 1.0 / (1.0 + 1.2 * max(0.0, nap_rms - 0.3)))
+  # Estimate per-ear AGC-damped proxy OHC scale from each ear's NAP drive.
+  ear_nap_rms = np.sqrt(np.mean(nap_c**2, axis=(0, 1)))
+  ohc_scale = np.minimum(
+    1.0, 1.0 / (1.0 + 1.2 * np.maximum(0.0, ear_nap_rms - 0.3))
+  )
 
+  # Cap open-loop IR length by physical duration (~0.15 s) so high-Q / high-fs
+  # models (e.g., 48 kHz) capture their longer impulse response tails.
+  max_ir_len = min(
+    8192, max(2048, 1 << int(math.ceil(math.log2(max(0.15 * fs, 1.0)))))
+  )
   ir_len = min(
-    4096, max(1024, 1 << int(math.ceil(math.log2(min(t_len, 4096)))))
+    max_ir_len,
+    max(1024, 1 << int(math.ceil(math.log2(min(t_len, max_ir_len))))),
   )
   n_fft = 1 << int(math.ceil(math.log2(t_len + ir_len)))
   bm_irs = _measure_carfac_bm_irs(
@@ -452,7 +481,11 @@ def _carfac_dsp_warm_start(
   if norm_rms >= 1e-8:
     x_unit = jnp.asarray(x_mid / norm_rms, dtype=jnp.float32)
     best_gain = _calibrate_scalar_gain(
-      x_unit, target_c_j, rest_j, cochlea_model
+      x_unit,
+      target_c_j,
+      rest_j,
+      cochlea_model,
+      reference_rms=norm_rms,
     )
     x1 = x_mid * (best_gain / norm_rms)
     nap1 = (
@@ -540,6 +573,7 @@ def _carfac_dsp_warm_start(
       target_c_j,
       rest_j,
       cochlea_model,
+      reference_rms=comb_rms,
     )
     x_comb = x_comb * (comb_gain / comb_rms)
 
@@ -1238,7 +1272,7 @@ def _optimize_window(
   if config.lbfgs_steps > 0:
     # Normalize parameters to O(1) RMS so L-BFGS's identity Hessian matches scale.
     u_rms = float(jnp.sqrt(jnp.mean(best_w**2)))
-    u_scale_val = 1e-2 if u_rms < 1e-8 else max(u_rms, 1e-5)
+    u_scale_val = 1e-2 if u_rms < 1e-9 else max(u_rms, 1e-7)
     u_scale_j = jnp.float32(u_scale_val)
     u_curr = best_w / u_scale_j
     lbfgs_opt = optax.lbfgs(

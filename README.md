@@ -8,19 +8,24 @@ and [`carfac`](https://github.com/google/carfac).
 
 ## Overview
 
-CARFAC transforms waveforms through a cascaded asymmetric resonator filterbank
-(`car_step`), asymmetric hair-cell rectification (`ihc_detect`), two-capacitor
-adaptation (`ihc_step`), an 80 µs low-pass filter (~2 kHz cutoff), and auditory
-nerve synapse modeling (`syn_step`). Below ~2–4 kHz, NAPs preserve fine temporal
-phase-locking; above ~4 kHz, carrier phase is attenuated into positive temporal
-envelopes.
+CARFAC v2 ([Lyon, 2011](#references); [Lyon, 2017](#references);
+[Lyon et al., 2024](#references)) transforms waveforms through a cascaded
+asymmetric resonator filterbank (`car_step`), asymmetric hair-cell
+rectification (`ihc_detect`), two-capacitor adaptation (`ihc_step`), an 80 µs
+low-pass filter (~2 kHz cutoff), and auditory nerve synapse modeling (`syn_step`)
+using the canonical CARFAC acoustic reference (`0 dBFS` sine peak = `104 dB SPL`,
+i.e., `RMS = 1.0 ≈ 107.01 dB SPL` via `sii.CARFAC_RMS_ONE_DB_SPL`). Below
+~2–4 kHz, NAPs preserve fine temporal phase-locking; above ~4 kHz, carrier phase
+is attenuated into positive temporal envelopes.
 
 `carfac-inversion` solves the inverse `NAP -> audio` problem in up to three stages:
 
 1. **Physics-Based CARFAC DSP Warm Start (`dsp_warm_start`)**:
-   - Measures open-loop CARFAC basilar-membrane impulse responses through any
-     configured conductive and middle-ear front-end filters at an AGC-damped
-     operating Q (`ohc_scale`).
+   - Measures open-loop CARFAC basilar-membrane impulse responses (duration-capped
+     at `~0.15 s` up to `8192` samples to accommodate high-Q / `48 kHz` tails)
+     through any configured conductive and middle-ear front-end filters at a
+     per-ear AGC-damped operating Q (`ohc_scale`), extending scalar gain search
+     brackets down to `1e-7` for retuned high-gain CARFAC configurations.
    - Two-pass apical recovery: Pass 1 inverts channels at or above
      `min_warm_start_cf_hz` (`250 Hz`) so quadratic `ohc_nlf` combination-tone
      distortion is excluded from initial phase recovery; Pass 2 subtracts the
@@ -238,7 +243,7 @@ Highlights on canonical out-of-domain `carfac/test_data` (`binaural_test.wav` & 
 - **Round-trip (`mode="exact"`, DSP + `45+135` L-BFGS @ `~111 s` -> DSP + Neural + `0+15` L-BFGS @ `~14 s`)**: `binaural_test` reached `SI-SDR 15.85 dB / STOI 0.9850` at `50 dB`, `STOI 0.9180 -> 0.9786` / `HASQI 0.479 -> 0.512` at `65 dB`, and `STOI 0.8219 -> 0.8857` / `HASPI 0.8863 -> 0.9945` / `HASQI 0.232 -> 0.284` at `80 dB` (`ws/ref 0.216 -> p3/ref 0.837`); `long_test` improved from `9.56 -> 13.57 dB` at `65 dB` and `7.70 -> 11.65 dB` at `80 dB`.
 - **Cross-cochlea auralization (`mode="perceptual"`, `perc030`)**: On `sloping` hearing loss (`65 dB`, 10 dB noisy), achieved `NAP corr 0.8721 / 0.9598`, `Env corr 0.9545 / 0.9874`, `SAI corr 0.9741 / 0.9908`, `HASPI 0.9938 / 0.9522`, and `STOI 0.9233 / 0.7282` (`binaural_test` / `long_test`). *(Scope caveat: the trained neural checkpoint targets same-cochlea `mode="exact"` reconstruction; passing impaired NAPs pulls output back toward healthy speech rather than staying on the impaired cochlear manifold (`nap_corr 0.29–0.62` vs. `perc030` `0.67–0.96`), so cross-cochlea auralization should use `mode="perceptual"` without the `exact`-trained checkpoint until a dedicated cross-cochlea checkpoint is trained.)*
 
-See [`docs/evaluation_phases.md`](docs/evaluation_phases.md) for the complete Phase 0–3 ablation log, accepted/rejected hypotheses, training details, and per-clip tables (`28 / 28` pytest tests passing across `inversion_test.py` (16), `neural_test.py` (5), `benchmark_suite_test.py` (4), and `invert_nap_test.py` (3)).
+See [`docs/evaluation_phases.md`](docs/evaluation_phases.md) for the complete Phase 0–3 ablation log, accepted/rejected hypotheses, training details, and per-clip tables (`31 / 31` pytest tests passing across `inversion_test.py` (17), `neural_test.py` (5), `benchmark_suite_test.py` (5), and `invert_nap_test.py` (4)).
 
 ## Development
 
@@ -253,5 +258,10 @@ pytest -v
 
 - Lyon, R. F. (2011). *Cascades of two-pole–two-zero asymmetric resonators are
   good models of peripheral auditory function*. JASA 130(6), 3893–3904.
+- Lyon, R. F. (2017). *Human and Machine Hearing: Extracting Meaning from Sound*.
+  Cambridge University Press.
+- Lyon, R. F., Schonberger, R., Slaney, M., Velimirović, M., & Yu, H. (2024).
+  *The CARFAC v2 Cochlear Model in Matlab, NumPy, and JAX*.
+  [arXiv:2404.17490](https://arxiv.org/abs/2404.17490).
 - [CARFAC](https://github.com/google/carfac)
 - [hp-acoustic](https://github.com/Australian-Future-Hearing-Initiative/hp-acoustic)
