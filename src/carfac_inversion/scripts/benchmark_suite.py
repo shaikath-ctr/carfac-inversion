@@ -7,6 +7,7 @@ speech when ``--input_dir`` is omitted.
 """
 
 import csv
+import dataclasses
 import importlib
 import math
 import pathlib
@@ -35,10 +36,12 @@ from hp_acoustic.metrics import perceptual
 from hp_acoustic.metrics import waveform as waveform_metrics
 from hp_acoustic.models import carfac
 from hp_acoustic.models import sai as sai_lib
+from jax_haspi_hasqi import haspi as haspi_lib
 from jax_haspi_hasqi import hasqi as hasqi_lib
 
 from carfac_inversion import arcfac_metrics
 from carfac_inversion import inversion
+from carfac_inversion import tpu
 
 
 def _load_optional_module(name: str) -> Any | None:
@@ -401,6 +404,24 @@ def _band_snrs_db(
   return out
 
 
+def _build_metric_context(
+  ref: np.ndarray,
+  est: np.ndarray,
+  sample_rate_hz: int,
+  hearing_loss_db: np.ndarray,
+) -> metric_context.Context:
+  """Builds ``metric_context.Context`` across hp-acoustic API versions."""
+  kwargs: dict[str, Any] = {
+    "reference": ref,
+    "estimation": est,
+    "sample_rate": sample_rate_hz,
+  }
+  ctx_fields = {f.name for f in dataclasses.fields(metric_context.Context)}
+  if "hearing_loss_db" in ctx_fields:
+    kwargs["hearing_loss_db"] = hearing_loss_db
+  return metric_context.Context(**kwargs)
+
+
 def _score_pair(
   *,
   ref: np.ndarray,
@@ -415,83 +436,89 @@ def _score_pair(
   common = min(len(ref), len(est))
   ref_c = ref[:common]
   est_c = est[:common]
-  ctx = metric_context.Context(
-    reference=ref_c,
-    estimation=est_c,
-    sample_rate=sample_rate_hz,
-    hearing_loss_db=hearing_loss_db,
-  )
+  ctx = _build_metric_context(ref_c, est_c, sample_rate_hz, hearing_loss_db)
   haspi_val = float("nan")
   hasqi_q = float("nan")
   hasqi_nl = float("nan")
   hasqi_lin = float("nan")
-  try:
-    haspi_val = perceptual.haspi(ctx)
-  except ValueError:
-    pass
-  if np.any(ctx.reference):
-    try:
-      q, nl, lin, _ = hasqi_lib.hasqi_v2(
-        ref_c,
-        sample_rate_hz,
-        est_c,
-        sample_rate_hz,
-        hearing_loss_db,
-        level1=CARFAC_RMS_ONE_DB_SPL,
-      )
-      hasqi_nl = float(nl)
-      hasqi_lin = float(lin)
-      if hasqi_nl != 0.0:
-        hasqi_q = float(q)
-    except ValueError:
-      pass
+  with tpu.host_cpu_context():
+    if np.any(ctx.reference):
+      try:
+        h_val, _ = haspi_lib.haspi_v2(
+          ref_c,
+          sample_rate_hz,
+          est_c,
+          sample_rate_hz,
+          hearing_loss_db,
+          level1=CARFAC_RMS_ONE_DB_SPL,
+        )
+        haspi_val = float(h_val)
+      except ValueError:
+        pass
+      try:
+        q, nl, lin, _ = hasqi_lib.hasqi_v2(
+          ref_c,
+          sample_rate_hz,
+          est_c,
+          sample_rate_hz,
+          hearing_loss_db,
+          level1=CARFAC_RMS_ONE_DB_SPL,
+        )
+        hasqi_nl = float(nl)
+        hasqi_lin = float(lin)
+        if hasqi_nl != 0.0:
+          hasqi_q = float(q)
+      except ValueError:
+        pass
 
-  freqs = np.fft.rfftfreq(len(target_nap), d=1.0 / sample_rate_hz)
-  lpf = (1.0 / (1.0 + (freqs / 200.0) ** 4))[:, None]
-  env_t = np.fft.irfft(
-    np.fft.rfft(np.maximum(target_nap, 0.0), axis=0) * lpf,
-    n=len(target_nap),
-    axis=0,
-  )
-  env_r = np.fft.irfft(
-    np.fft.rfft(np.maximum(recon_nap, 0.0), axis=0) * lpf,
-    n=len(recon_nap),
-    axis=0,
-  )
-  sai_len = min(2048, 2 ** int(math.floor(math.log2(len(target_nap)))))
-  sai_corr = float("nan")
-  if sai_len >= 64:
-    sai_h = sai_lib.SaiHypers(fft_len=sai_len)
-    s_t = sai_lib.from_naps(jnp.asarray(target_nap[None, :, :]), sai_h)
-    s_r = sai_lib.from_naps(jnp.asarray(recon_nap[None, :, :]), sai_h)
-    sai_corr = float(
-      np.corrcoef(np.asarray(s_t).ravel(), np.asarray(s_r).ravel())[0, 1]
+    freqs = np.fft.rfftfreq(len(target_nap), d=1.0 / sample_rate_hz)
+    lpf = (1.0 / (1.0 + (freqs / 200.0) ** 4))[:, None]
+    env_t = np.fft.irfft(
+      np.fft.rfft(np.maximum(target_nap, 0.0), axis=0) * lpf,
+      n=len(target_nap),
+      axis=0,
     )
+    env_r = np.fft.irfft(
+      np.fft.rfft(np.maximum(recon_nap, 0.0), axis=0) * lpf,
+      n=len(recon_nap),
+      axis=0,
+    )
+    sai_len = min(2048, 2 ** int(math.floor(math.log2(len(target_nap)))))
+    sai_corr = float("nan")
+    if sai_len >= 64:
+      sai_h = sai_lib.SaiHypers(fft_len=sai_len)
+      s_t = sai_lib.from_naps(jnp.asarray(target_nap[None, :, :]), sai_h)
+      s_r = sai_lib.from_naps(jnp.asarray(recon_nap[None, :, :]), sai_h)
+      sai_corr = float(
+        np.corrcoef(np.asarray(s_t).ravel(), np.asarray(s_r).ravel())[0, 1]
+      )
 
-  row: dict[str, float] = {
-    "si_sdr": waveform_metrics.si_sdr(ctx),
-    "snr": waveform_metrics.snr(ctx),
-    "stoi": perceptual.stoi(ctx),
-    "haspi": haspi_val,
-    "hasqi": hasqi_q,
-    "hasqi_nl": hasqi_nl,
-    "hasqi_lin": hasqi_lin,
-    "nap_corr": float(np.corrcoef(target_nap.ravel(), recon_nap.ravel())[0, 1]),
-    "env_corr": float(np.corrcoef(env_t.ravel(), env_r.ravel())[0, 1]),
-    "sai_corr": sai_corr,
-  }
-  row.update(_band_snrs_db(ref_c, est_c, sample_rate_hz))
-  arc_scores = arcfac_metrics.score_arcfac(
-    ref_c,
-    est_c,
-    n_target=target_nap,
-    n_healthy_ref=(
-      healthy_ref_nap if healthy_ref_nap is not None else target_nap
-    ),
-    n_healthy_est=recon_nap,
-    sample_rate_hz=sample_rate_hz,
-  )
-  row.update(arcfac_metrics.flatten_arcfac_metrics(arc_scores))
+    row: dict[str, float] = {
+      "si_sdr": waveform_metrics.si_sdr(ctx),
+      "snr": waveform_metrics.snr(ctx),
+      "stoi": perceptual.stoi(ctx),
+      "haspi": haspi_val,
+      "hasqi": hasqi_q,
+      "hasqi_nl": hasqi_nl,
+      "hasqi_lin": hasqi_lin,
+      "nap_corr": float(
+        np.corrcoef(target_nap.ravel(), recon_nap.ravel())[0, 1]
+      ),
+      "env_corr": float(np.corrcoef(env_t.ravel(), env_r.ravel())[0, 1]),
+      "sai_corr": sai_corr,
+    }
+    row.update(_band_snrs_db(ref_c, est_c, sample_rate_hz))
+    arc_scores = arcfac_metrics.score_arcfac(
+      ref_c,
+      est_c,
+      n_target=target_nap,
+      n_healthy_ref=(
+        healthy_ref_nap if healthy_ref_nap is not None else target_nap
+      ),
+      n_healthy_est=recon_nap,
+      sample_rate_hz=sample_rate_hz,
+    )
+    row.update(arcfac_metrics.flatten_arcfac_metrics(arc_scores))
   return row
 
 

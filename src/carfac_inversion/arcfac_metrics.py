@@ -14,6 +14,8 @@ import numpy as np
 import scipy.signal
 from hp_acoustic.models import sai as sai_lib
 
+from carfac_inversion import tpu
+
 FULL_SCALE_DB_SPL = 104.0
 LEVEL_BANDS_DB = (45.0, 60.0, 75.0)
 SPACES = ("nap", "sai")
@@ -51,8 +53,9 @@ def sai_of_naps(
   hypers: sai_lib.SaiHypers = DEFAULT_SAI_HYPERS,
 ) -> np.ndarray:
   """Converts NAPs ``(batch, samples, channels)`` to ``(batch, frames, lags, channels)``."""
-  sai = sai_lib.from_naps(jnp.asarray(naps, dtype=jnp.float32), hypers)
-  return np.asarray(jnp.moveaxis(sai, 0, 1), dtype=np.float32)
+  with tpu.host_cpu_context():
+    sai = sai_lib.from_naps(jnp.asarray(naps, dtype=jnp.float32), hypers)
+    return np.asarray(jnp.moveaxis(sai, 0, 1), dtype=np.float32)
 
 
 def _frame_levels(

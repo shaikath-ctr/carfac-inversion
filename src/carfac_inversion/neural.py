@@ -27,6 +27,8 @@ from flax import traverse_util
 from hp_acoustic.models import carfac
 from hp_acoustic.models import cochlea
 
+from carfac_inversion import tpu
+
 # Default canonical cochleotopic projection bins for 16 kHz speech.
 DEFAULT_COCH_BINS = 64
 DEFAULT_CF_MIN_HZ = 40.0
@@ -200,6 +202,41 @@ def eval_cochlea(
   """Evaluates ``cochlea_model(wave)`` inside a cached XLA computation."""
   dyn_cochlea, static_cochlea = split_cochlea(cochlea_model)
   return _eval_cochlea_jit(wave, dyn_cochlea, static_cochlea)
+
+
+def cochlea_to_host(cm: Any) -> Any:
+  """Converts JAX array leaves and static CARFAC hypers to host NumPy."""
+
+  def _to_host(leaf: Any) -> Any:
+    return np.asarray(leaf) if isinstance(leaf, jax.Array) else leaf
+
+  host_cm = jax.tree.map(_to_host, cm)
+  hypers = getattr(host_cm, "hypers", None)
+  if hypers is not None:
+    host_cm = dataclasses.replace(
+      host_cm, hypers=jax.tree.map(_to_host, hypers)
+    )
+  return host_cm
+
+
+def replicate_cochlea(cm: Any, mesh: jax.sharding.Mesh) -> Any:
+  """Replicates array leaves of a cochlea (and CARFAC hypers) onto ``mesh``."""
+  rep = tpu.replicated_sharding(mesh)
+
+  def _to_tpu(leaf: Any) -> Any:
+    if not isinstance(leaf, (jax.Array, np.ndarray)):
+      return leaf
+    if isinstance(leaf, jax.Array) and leaf.sharding == rep:
+      return leaf
+    if jax.process_count() > 1:
+      return jax.make_array_from_process_local_data(rep, np.asarray(leaf))
+    return jax.device_put(leaf, rep)
+
+  rep_cm = jax.tree.map(_to_tpu, cm)
+  hypers = getattr(rep_cm, "hypers", None)
+  if hypers is not None:
+    rep_cm = dataclasses.replace(rep_cm, hypers=jax.tree.map(_to_tpu, hypers))
+  return rep_cm
 
 
 def cochlea_cf_projection(

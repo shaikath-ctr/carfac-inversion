@@ -7,7 +7,6 @@ alongside perceptual speech metrics (``SI-SDR``, ``STOI``, ``HASPI``, ``HASQI``)
 """
 
 import csv
-import dataclasses
 import importlib
 import pathlib
 import sys
@@ -25,6 +24,8 @@ from hp_acoustic.models import carfac
 
 from carfac_inversion import arcfac_metrics
 from carfac_inversion import inversion
+from carfac_inversion import nap_inverter
+from carfac_inversion import neural
 from carfac_inversion import tpu
 from carfac_inversion.scripts import benchmark_suite
 
@@ -51,6 +52,7 @@ _ARCFAC_EPS_REL: flags.FlagHolder[float]
 _SLANEY_ITERS: flags.FlagHolder[int]
 _NEURAL_CHECKPOINT: flags.FlagHolder[str | None]
 _PERCEPTUAL_NEURAL_CHECKPOINT: flags.FlagHolder[str | None]
+_PHASE4_CHECKPOINT: flags.FlagHolder[str | None]
 _SEED: flags.FlagHolder[int]
 
 
@@ -77,6 +79,7 @@ def define_flags(flag_values: flags.FlagValues = FLAGS) -> None:
   global _SLANEY_ITERS
   global _NEURAL_CHECKPOINT
   global _PERCEPTUAL_NEURAL_CHECKPOINT
+  global _PHASE4_CHECKPOINT
   global _SEED
 
   _INPUT_DIR = flags.DEFINE_string(
@@ -205,6 +208,12 @@ def define_flags(flag_values: flags.FlagValues = FLAGS) -> None:
     "Optional perceptual neural refiner checkpoint path.",
     flag_values=flag_values,
   )
+  _PHASE4_CHECKPOINT = flags.DEFINE_string(
+    "phase4_checkpoint",
+    None,
+    "Optional Phase 4 direct causal inverter checkpoint (.npz) path.",
+    flag_values=flag_values,
+  )
   _SEED = flags.DEFINE_integer("seed", 0, "PRNG seed.", flag_values=flag_values)
 
 
@@ -226,39 +235,8 @@ def _load_arcfac_modules(arcfac_src: str | None) -> tuple[Any, Any, Any]:
   return ear_mod, match_mod, slaney_mod
 
 
-def _cochlea_to_host(cm: Any) -> Any:
-  """Converts JAX array leaves and static CARFAC hypers to host NumPy."""
-
-  def _to_host(leaf: Any) -> Any:
-    return np.asarray(leaf) if isinstance(leaf, jax.Array) else leaf
-
-  host_cm = jax.tree.map(_to_host, cm)
-  hypers = getattr(host_cm, "hypers", None)
-  if hypers is not None:
-    host_cm = dataclasses.replace(
-      host_cm, hypers=jax.tree.map(_to_host, hypers)
-    )
-  return host_cm
-
-
-def _replicate_cochlea(cm: Any, mesh: jax.sharding.Mesh) -> Any:
-  """Replicates array leaves of a cochlea (and CARFAC hypers) onto ``mesh``."""
-  rep = tpu.replicated_sharding(mesh)
-
-  def _to_tpu(leaf: Any) -> Any:
-    if not isinstance(leaf, (jax.Array, np.ndarray)):
-      return leaf
-    if isinstance(leaf, jax.Array) and leaf.sharding == rep:
-      return leaf
-    if jax.process_count() > 1:
-      return jax.make_array_from_process_local_data(rep, np.asarray(leaf))
-    return jax.device_put(leaf, rep)
-
-  rep_cm = jax.tree.map(_to_tpu, cm)
-  hypers = getattr(rep_cm, "hypers", None)
-  if hypers is not None:
-    rep_cm = dataclasses.replace(rep_cm, hypers=jax.tree.map(_to_tpu, hypers))
-  return rep_cm
+_cochlea_to_host = neural.cochlea_to_host
+_replicate_cochlea = neural.replicate_cochlea
 
 
 def _build_target_cochlea(
@@ -303,6 +281,7 @@ def _run_method(
   chunk_seconds: float | None,
   neural_checkpoint: str | None,
   perceptual_neural_checkpoint: str | None,
+  phase4_checkpoint: str | None,
   arcfac_mods: tuple[Any, Any, Any] | None,
   arcfac_steps: int,
   arcfac_start: str,
@@ -331,6 +310,20 @@ def _run_method(
     t0 = time.perf_counter()
     res = inversion.invert_nap(target_nap, healthy, cfg)
     return res.waveform, time.perf_counter() - t0
+
+  if method == "phase4_direct":
+    if not phase4_checkpoint:
+      raise ValueError(
+        "Method 'phase4_direct' requires --phase4_checkpoint=<path>."
+      )
+    t0 = time.perf_counter()
+    wav = nap_inverter.invert_nap_direct(
+      target_nap,
+      phase4_checkpoint,
+      align_lookahead=True,
+      cochlea_model=healthy,
+    )
+    return wav, time.perf_counter() - t0
 
   if arcfac_mods is None:
     raise RuntimeError(f"arcfac modules were not loaded for method {method!r}.")
@@ -456,6 +449,7 @@ def run_arcfac_benchmark(
   slaney_iters: int = 30,
   neural_checkpoint: str | None = None,
   perceptual_neural_checkpoint: str | None = None,
+  phase4_checkpoint: str | None = None,
   seed: int = 0,
 ) -> list[dict[str, Any]]:
   """Runs head-to-head comparison between ``carfac_inversion`` and ``arcfac``."""
@@ -524,6 +518,7 @@ def run_arcfac_benchmark(
           chunk_seconds=chunk_seconds,
           neural_checkpoint=neural_checkpoint,
           perceptual_neural_checkpoint=perceptual_neural_checkpoint,
+          phase4_checkpoint=phase4_checkpoint,
           arcfac_mods=arcfac_mods,
           arcfac_steps=arcfac_steps,
           arcfac_start=arcfac_start,
@@ -617,6 +612,7 @@ def main(argv: Sequence[str]) -> None:
     slaney_iters=_SLANEY_ITERS.value,
     neural_checkpoint=_NEURAL_CHECKPOINT.value,
     perceptual_neural_checkpoint=_PERCEPTUAL_NEURAL_CHECKPOINT.value,
+    phase4_checkpoint=_PHASE4_CHECKPOINT.value,
     seed=_SEED.value,
   )
 
