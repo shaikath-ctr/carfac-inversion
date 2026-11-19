@@ -245,30 +245,37 @@ def _normalize_target_nap(
   return nap_3d, is_2d
 
 
-def _measure_carfac_bm_irs(
-  cochlea_model: carfac.CarfacCochleaModel,
+@functools.partial(jax.jit, static_argnums=(0,))
+def _measure_carfac_bm_irs_jit(
   ir_len: int,
-  ohc_scale: float | np.ndarray = 1.0,
-) -> np.ndarray:
-  """Measures open-loop CARFAC basilar-membrane impulse responses."""
+  scale_arr: jnp.ndarray,
+  cochlea_model: carfac.CarfacCochleaModel,
+) -> jnp.ndarray:
+  """JIT-compiled open-loop CARFAC basilar-membrane impulse responses."""
   num_ears = len(cochlea_model.hypers.ears)
   imp = jnp.zeros((ir_len, num_ears), dtype=jnp.float32)
   imp = imp.at[0, :].set(_IMPULSE_AMPLITUDE)
-  w = conductive.apply(imp, cochlea_model.conductive_filter)
-  w = middle_ear.apply(w, cochlea_model.middle_ear_filter)
+  conductive_filter = getattr(cochlea_model, "conductive_filter", None)
+  w = (
+    conductive.apply(imp, conductive_filter)
+    if conductive_filter is not None
+    else imp
+  )
+  middle_ear_filter = getattr(cochlea_model, "middle_ear_filter", None)
+  if middle_ear_filter is not None:
+    w = middle_ear.apply(w, middle_ear_filter)
 
-  scale_arr = np.asarray(ohc_scale, dtype=np.float32)
   state_ears = []
   for ear_idx in range(num_ears):
     ear_hypers = cochlea_model.hypers.ears[ear_idx]
     ear_weights = cochlea_model.weights.ears[ear_idx]
     ear_state = cochlea_model.initial_state.ears[ear_idx]
     if scale_arr.ndim == 0:
-      ear_scale: float | jnp.ndarray = float(scale_arr)
+      ear_scale = scale_arr
     elif scale_arr.ndim == 1:
-      ear_scale = float(scale_arr[ear_idx])
+      ear_scale = scale_arr[ear_idx]
     else:
-      ear_scale = jnp.asarray(scale_arr[:, ear_idx], dtype=jnp.float32)
+      ear_scale = scale_arr[:, ear_idx]
     undamping = ear_weights.car.ohc_health * ear_scale
     zb = ear_hypers.car.zr_coeffs * undamping
     g = carfac_jax.stage_g(ear_weights.car, undamping)
@@ -285,7 +292,20 @@ def _measure_carfac_bm_irs(
     state_proxy,
     open_loop=True,
   )
-  return np.asarray(out.bm, dtype=np.float64) / _IMPULSE_AMPLITUDE
+  return out.bm
+
+
+def _measure_carfac_bm_irs(
+  cochlea_model: carfac.CarfacCochleaModel,
+  ir_len: int,
+  ohc_scale: float | np.ndarray = 1.0,
+) -> np.ndarray:
+  """Measures open-loop CARFAC basilar-membrane impulse responses."""
+  dyn_cochlea = jax.tree_util.tree_map(jax.lax.stop_gradient, cochlea_model)
+  bm = _measure_carfac_bm_irs_jit(
+    ir_len, jnp.asarray(ohc_scale, dtype=jnp.float32), dyn_cochlea
+  )
+  return np.asarray(bm, dtype=np.float64) / _IMPULSE_AMPLITUDE
 
 
 def _ihc_lpf_inverse(
@@ -316,44 +336,10 @@ def _ihc_lpf_inverse(
   return np.conj(h_lpf) / (np.abs(h_lpf) ** 2 + 0.05)
 
 
-class _StaticModelRef:
-  """Identity-hashed wrapper allowing non-PyTree CochleaModels in static JIT."""
-
-  def __init__(self, model: cochlea.CochleaModel) -> None:
-    self.model = model
-
-  def __hash__(self) -> int:
-    return id(self.model)
-
-  def __eq__(self, other: object) -> bool:
-    return isinstance(other, _StaticModelRef) and self.model is other.model
-
-
-def _split_cochlea(
-  cochlea_model: cochlea.CochleaModel,
-) -> tuple[cochlea.CochleaModel | None, _StaticModelRef | None]:
-  """Splits a CochleaModel into dynamic PyTree or static non-PyTree form."""
-  is_pytree = not jax.tree_util.treedef_is_leaf(
-    jax.tree_util.tree_structure(cochlea_model)
-  )
-  if is_pytree:
-    return (
-      jax.tree_util.tree_map(jax.lax.stop_gradient, cochlea_model),
-      None,
-    )
-  return None, _StaticModelRef(cochlea_model)
-
-
-def _run_cochlea(
-  wave: jnp.ndarray,
-  dyn_cochlea: cochlea.CochleaModel | None,
-  static_cochlea: _StaticModelRef | None,
-) -> jnp.ndarray:
-  """Evaluates either a dynamic PyTree or static non-PyTree CochleaModel."""
-  if dyn_cochlea is not None:
-    return dyn_cochlea(wave)
-  assert static_cochlea is not None
-  return static_cochlea.model(wave)
+_StaticModelRef = neural.StaticModelRef
+_split_cochlea = neural.split_cochlea
+_run_cochlea = neural.run_cochlea
+_eval_cochlea = neural.eval_cochlea
 
 
 @functools.partial(jax.jit, static_argnames=("static_cochlea",))
@@ -444,7 +430,7 @@ def _carfac_dsp_warm_start(
 ) -> np.ndarray:
   """Constructs a delay- and gain-calibrated waveform from CARFAC NAPs."""
   t_len, n_ch, n_ears = nap_3d.shape
-  fs = float(cochlea_model.sample_rate)
+  fs = neural.cochlea_sample_rate(cochlea_model)
   cfs = np.asarray(cochlea_model.channel_frequencies, dtype=np.float64)
   nap_c = nap_3d.astype(np.float64) - rest_nap[None, :, :]
 
@@ -541,7 +527,8 @@ def _carfac_dsp_warm_start(
     x1 = x_mid * (best_gain / norm_rms)
     nap1 = (
       np.asarray(
-        cochlea_model(jnp.asarray(x1, dtype=jnp.float32)), dtype=np.float64
+        _eval_cochlea(cochlea_model, jnp.asarray(x1, dtype=jnp.float32)),
+        dtype=np.float64,
       )
       - rest_nap[None, :, :]
     )
@@ -632,7 +619,8 @@ def _carfac_dsp_warm_start(
   if added_any_apical or norm_rms < 1e-8:
     nap_eq = (
       np.asarray(
-        cochlea_model(jnp.asarray(x_comb, dtype=jnp.float32)), dtype=np.float64
+        _eval_cochlea(cochlea_model, jnp.asarray(x_comb, dtype=jnp.float32)),
+        dtype=np.float64,
       )
       - rest_nap[None, :, :]
     )
@@ -676,7 +664,7 @@ def _generic_dsp_warm_start(
 ) -> np.ndarray:
   """Fallback warm start for non-CARFAC ``CochleaModel`` implementations."""
   t_len, n_ch, n_ears = nap_3d.shape
-  fs = float(cochlea_model.sample_rate)
+  fs = neural.cochlea_sample_rate(cochlea_model)
   nap_c = nap_3d.astype(np.float64) - rest_nap[None, :, :]
   rng = np.random.default_rng(config.seed)
 
@@ -744,7 +732,9 @@ def dsp_warm_start(
 
   rest_len = min(512, t_len)
   rest_nap = np.asarray(
-    cochlea_model(jnp.zeros((rest_len, n_ears), dtype=jnp.float32))[-1],
+    _eval_cochlea(
+      cochlea_model, jnp.zeros((rest_len, n_ears), dtype=jnp.float32)
+    )[-1],
     dtype=np.float64,
   )
   if float(np.max(np.abs(nap_3d - rest_nap[None, :, :]))) < _SILENCE_NAP_PEAK:
@@ -1355,12 +1345,14 @@ def invert_nap(
   cfg = InversionConfig() if config is None else config
   nap_3d, is_2d = _normalize_target_nap(target_nap, cochlea_model)
   t_len, n_ch, n_ears = nap_3d.shape
-  fs = float(cochlea_model.sample_rate)
+  fs = neural.cochlea_sample_rate(cochlea_model)
   fs_int = int(round(fs))
 
   rest_len = min(512, t_len)
   rest_nap_j = jnp.asarray(
-    cochlea_model(jnp.zeros((rest_len, n_ears), dtype=jnp.float32))[-1:],
+    _eval_cochlea(
+      cochlea_model, jnp.zeros((rest_len, n_ears), dtype=jnp.float32)
+    )[-1:],
     dtype=jnp.float32,
   )
   rest_nap_np = np.asarray(rest_nap_j[0], dtype=np.float32)
@@ -1372,7 +1364,8 @@ def invert_nap(
   ):
     zeros_w = np.zeros((t_len, n_ears), dtype=np.float32)
     recon_nap = np.asarray(
-      cochlea_model(jnp.asarray(zeros_w, dtype=jnp.float32)), dtype=np.float32
+      _eval_cochlea(cochlea_model, jnp.asarray(zeros_w, dtype=jnp.float32)),
+      dtype=np.float32,
     )
     return NapInversionResult(
       waveform=zeros_w[:, 0] if is_2d else zeros_w,
@@ -1526,7 +1519,9 @@ def invert_nap(
       jnp.asarray(out_pad[:t_len], dtype=jnp.float32), full_mask_j, t_len
     )
 
-  recon_3d = np.asarray(cochlea_model(final_w_2d), dtype=np.float32)
+  recon_3d = np.asarray(
+    _eval_cochlea(cochlea_model, final_w_2d), dtype=np.float32
+  )
   # Compute full-clip final loss against the blended output.
   full_mask_j = _audible_band_mask(t_len, fs, cochlea_model, cfg)
   full_sai_len = min(2048, 2 ** int(math.floor(math.log2(t_len))))

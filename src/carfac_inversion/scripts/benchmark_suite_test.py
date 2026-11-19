@@ -77,6 +77,8 @@ class BenchmarkSuiteTest(absltest.TestCase):
       with csv_path.open() as f:
         parsed = list(csv.DictReader(f))
       self.assertLen(parsed, len(rows))
+      self.assertIn("arcfac_nap_round_trip_rel", parsed[0])
+      self.assertIn("arcfac_sai_direction", parsed[0])
       self.assertTrue(
         (
           pathlib.Path(tmp_dir) / "charts" / "pareto_quality_vs_runtime.png"

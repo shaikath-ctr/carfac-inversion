@@ -129,6 +129,79 @@ def channel_projection_matrix(
   return weights
 
 
+def cochlea_sample_rate(cochlea_model: cochlea.CochleaModel) -> float:
+  """Returns the sample rate in Hz across ``hp_acoustic`` API versions."""
+  for attr in ("sample_rate", "sampling_rate", "fs"):
+    rate = getattr(cochlea_model, attr, None)
+    if rate is not None:
+      return float(rate)
+  raise AttributeError(
+    f"{type(cochlea_model).__name__} has no sample_rate, sampling_rate, or fs"
+  )
+
+
+class StaticModelRef:
+  """Identity-hashed wrapper allowing non-PyTree CochleaModels in static JIT."""
+
+  def __init__(self, model: cochlea.CochleaModel) -> None:
+    """Wraps ``model`` with object-identity hashing and equality."""
+    self.model = model
+
+  def __hash__(self) -> int:
+    """Hashes by underlying object identity."""
+    return id(self.model)
+
+  def __eq__(self, other: object) -> bool:
+    """Compares equal only when wrapping the exact same object."""
+    return isinstance(other, StaticModelRef) and self.model is other.model
+
+
+def split_cochlea(
+  cochlea_model: cochlea.CochleaModel,
+) -> tuple[cochlea.CochleaModel | None, StaticModelRef | None]:
+  """Splits a CochleaModel into dynamic PyTree or static non-PyTree form."""
+  is_pytree = not jax.tree_util.treedef_is_leaf(
+    jax.tree_util.tree_structure(cochlea_model)
+  )
+  if is_pytree:
+    return (
+      jax.tree_util.tree_map(jax.lax.stop_gradient, cochlea_model),
+      None,
+    )
+  return None, StaticModelRef(cochlea_model)
+
+
+def run_cochlea(
+  wave: jnp.ndarray,
+  dyn_cochlea: cochlea.CochleaModel | None,
+  static_cochlea: StaticModelRef | None,
+) -> jnp.ndarray:
+  """Evaluates either a dynamic PyTree or static non-PyTree CochleaModel."""
+  if dyn_cochlea is not None:
+    return dyn_cochlea(wave)
+  assert static_cochlea is not None
+  return static_cochlea.model(wave)
+
+
+@functools.partial(jax.jit, static_argnames=("static_cochlea",))
+def _eval_cochlea_jit(
+  wave: jnp.ndarray,
+  dyn_cochlea: cochlea.CochleaModel | None,
+  static_cochlea: StaticModelRef | None,
+) -> jnp.ndarray:
+  """JIT-compiled cochlea forward pass supporting PyTree and mock models."""
+  return run_cochlea(wave, dyn_cochlea, static_cochlea)
+
+
+def eval_cochlea(
+  cochlea_model: cochlea.CochleaModel,
+  wave: jnp.ndarray,
+) -> jnp.ndarray:
+  """Evaluates ``cochlea_model(wave)`` inside a cached XLA computation."""
+  dyn_cochlea, static_cochlea = split_cochlea(cochlea_model)
+  return _eval_cochlea_jit(wave, dyn_cochlea, static_cochlea)
+
+
 def cochlea_cf_projection(
   cochlea_model: cochlea.CochleaModel,
   config: NeuralRefinerConfig,
@@ -467,11 +540,11 @@ def _refine_single_window(
   ws_j = jnp.asarray(ws_win, dtype=jnp.float32)
   if prefix_ws is not None and prefix_ws.shape[0] > 0:
     prefix_j = jnp.asarray(prefix_ws, dtype=jnp.float32)
-    ws_nap_raw = cochlea_model(jnp.concatenate([prefix_j, ws_j], axis=0))[
-      prefix_ws.shape[0] :
-    ]
+    ws_nap_raw = eval_cochlea(
+      cochlea_model, jnp.concatenate([prefix_j, ws_j], axis=0)
+    )[prefix_ws.shape[0] :]
   else:
-    ws_nap_raw = cochlea_model(ws_j)
+    ws_nap_raw = eval_cochlea(cochlea_model, ws_j)
   tgt_j = jnp.asarray(tgt_win, dtype=jnp.float32)
 
   # Project centered NAPs to canonical CF bins and stack ears along batch.
@@ -537,14 +610,16 @@ def refine_waveform(
 
   rest_len = min(512, t_len)
   rest_nap_j = jnp.asarray(
-    cochlea_model(jnp.zeros((rest_len, n_ears), dtype=jnp.float32))[-1:],
+    eval_cochlea(
+      cochlea_model, jnp.zeros((rest_len, n_ears), dtype=jnp.float32)
+    )[-1:],
     dtype=jnp.float32,
   )
   proj_w_j = jnp.asarray(
     cochlea_cf_projection(cochlea_model, config), dtype=jnp.float32
   )
 
-  fs = float(cochlea_model.sample_rate)
+  fs = cochlea_sample_rate(cochlea_model)
   chunk_samples = (
     int(round(chunk_seconds * fs)) if chunk_seconds is not None else t_len
   )

@@ -911,21 +911,25 @@ def _run_perceptual_training(
   cfg = dataclasses.replace(base_cfg, target_mode="perceptual")
   model = neural.NapResidualRefiner(config=cfg)
   fs = int(round(cfg.sample_rate_hz))
-  cochlea_model = carfac.build(fs=fs)
 
   with np.load(train_cache) as d_tr:
     t_len = int(d_tr["ws_wavs"].shape[1])
-  rest_nap = np.asarray(
-    cochlea_model(jnp.zeros((min(512, t_len), 1), dtype=jnp.float32))[-1, :, 0],
-    dtype=np.float32,
-  )
-  proj_w = neural.cochlea_cf_projection(cochlea_model, cfg)
+  with tpu.host_cpu_context():
+    cochlea_model = carfac.build(fs=fs)
+    rest_nap = np.asarray(
+      cochlea_model(jnp.zeros((min(512, t_len), 1), dtype=jnp.float32))[
+        -1, :, 0
+      ],
+      dtype=np.float32,
+    )
+    proj_w = neural.cochlea_cf_projection(cochlea_model, cfg)
+    cochlea_host = jax.tree_util.tree_map(
+      jax.lax.stop_gradient, tpu.to_host_tree(cochlea_model)
+    )
   rest_nap_j = tpu.replicate_tree(
     jnp.asarray(rest_nap, dtype=jnp.float32), mesh
   )
-  rep_cochlea = tpu.replicate_tree(
-    jax.tree_util.tree_map(jax.lax.stop_gradient, cochlea_model), mesh
-  )
+  rep_cochlea = tpu.replicate_tree(cochlea_host, mesh)
 
   print(
     f"Loading Phase 3b perceptual caches ({fs} Hz, T={t_len}, "
@@ -946,17 +950,18 @@ def _run_perceptual_training(
   )
 
   if init_params is None:
-    raw_params = model.init(
-      jax.random.PRNGKey(seed),
-      jnp.zeros((1, t_len), dtype=jnp.float32),
-      jnp.zeros((1, t_len, cfg.n_coch_bins), dtype=jnp.float32),
-      jnp.zeros((1, t_len, cfg.n_coch_bins), dtype=jnp.float32),
-    )
-    init_host = tpu.to_host_tree(raw_params)
-    tpu.delete_tree(raw_params)
-    params = cast(Mapping[str, Any], tpu.replicate_tree(init_host, mesh))
+    with tpu.host_cpu_context():
+      raw_params = model.init(
+        jax.random.PRNGKey(seed),
+        jnp.zeros((1, t_len), dtype=jnp.float32),
+        jnp.zeros((1, t_len, cfg.n_coch_bins), dtype=jnp.float32),
+        jnp.zeros((1, t_len, cfg.n_coch_bins), dtype=jnp.float32),
+      )
+      init_host = tpu.to_host_tree(raw_params)
+    params_host: Mapping[str, Any] = init_host
   else:
-    params = cast(Mapping[str, Any], tpu.replicate_tree(init_params, mesh))
+    params_host = tpu.to_host_tree(init_params)
+  params = cast(Mapping[str, Any], tpu.replicate_tree(params_host, mesh))
 
   warmup = min(50, max(1, steps // 10))
   schedule = optax.warmup_cosine_decay_schedule(
@@ -970,7 +975,9 @@ def _run_perceptual_training(
     optax.clip_by_global_norm(2.0),
     optax.adamw(learning_rate=schedule, weight_decay=1e-4),
   )
-  opt_state = tpu.replicate_tree(tx.init(params), mesh)
+  with tpu.host_cpu_context():
+    opt_host = tpu.to_host_tree(tx.init(params_host))
+  opt_state = tpu.replicate_tree(opt_host, mesh)
 
   def _loss_on_batch(
     pr: Mapping[str, Any],
@@ -1295,7 +1302,6 @@ def run_training(
   cfg = neural.NeuralRefinerConfig() if model_config is None else model_config
   model = neural.NapResidualRefiner(config=cfg)
   fs = int(round(cfg.sample_rate_hz))
-  cochlea_model = carfac.build(fs=fs)
 
   with np.load(train_cache) as d_tr:
     tr_tgt_w = np.asarray(d_tr["target_wavs"], dtype=np.float32)
@@ -1307,25 +1313,31 @@ def run_training(
     va_has_naps = "target_naps" in d_va
 
   n_train, t_len = tr_tgt_w.shape
-  rest_nap = np.asarray(
-    cochlea_model(jnp.zeros((min(512, t_len), 1), dtype=jnp.float32))[-1, :, 0],
-    dtype=np.float32,
-  )
-  proj_w = neural.cochlea_cf_projection(cochlea_model, cfg)
-  cfs = np.asarray(cochlea_model.channel_frequencies, dtype=np.float32)
+  with tpu.host_cpu_context():
+    cochlea_model = carfac.build(fs=fs)
+    rest_nap = np.asarray(
+      cochlea_model(jnp.zeros((min(512, t_len), 1), dtype=jnp.float32))[
+        -1, :, 0
+      ],
+      dtype=np.float32,
+    )
+    proj_w = neural.cochlea_cf_projection(cochlea_model, cfg)
+    cfs = np.asarray(cochlea_model.channel_frequencies, dtype=np.float32)
+    cochlea_host = jax.tree_util.tree_map(
+      jax.lax.stop_gradient, tpu.to_host_tree(cochlea_model)
+    )
   hf_chan_mask = tpu.replicate_tree(
     jnp.asarray((cfs >= 3500.0).astype(np.float32)), mesh
   )
   rest_nap_j = tpu.replicate_tree(
     jnp.asarray(rest_nap, dtype=jnp.float32), mesh
   )
-  fixed_cochlea = tpu.replicate_tree(
-    jax.tree_util.tree_map(jax.lax.stop_gradient, cochlea_model), mesh
-  )
+  fixed_cochlea = tpu.replicate_tree(cochlea_host, mesh)
 
   print(
     f"Precomputing cochlear features ({n_train} train, {len(va_tgt_w)} val, "
-    f"backend={backend}, devices={n_devices}, K={steps_per_loop})..."
+    f"backend={backend}, devices={n_devices}, K={steps_per_loop})...",
+    flush=True,
   )
   if tr_has_naps:
     _, tr_can_tgt, tr_can_ws, tr_raw_nap = _load_perceptual_cache(
@@ -1343,21 +1355,25 @@ def run_training(
     va_raw_nap, va_can_tgt, va_can_ws = _precompute_cochlear_features(
       va_tgt_w, va_ws_w, fixed_cochlea, proj_w, rest_nap
     )
-  print(f"Feature precompute done in {time.perf_counter() - t0:.1f}s")
-
-  rng = jax.random.PRNGKey(seed)
-  np_rng = np.random.default_rng(seed)
-  raw_params = model.init(
-    rng,
-    jnp.zeros((1, t_len), dtype=jnp.float32),
-    jnp.zeros((1, t_len, cfg.n_coch_bins), dtype=jnp.float32),
-    jnp.zeros((1, t_len, cfg.n_coch_bins), dtype=jnp.float32),
+  print(
+    f"Feature precompute done in {time.perf_counter() - t0:.1f}s", flush=True
   )
-  init_params_host = tpu.to_host_tree(raw_params)
-  tpu.delete_tree(raw_params)
+
+  np_rng = np.random.default_rng(seed)
+  with tpu.host_cpu_context():
+    rng = jax.random.PRNGKey(seed)
+    raw_params = model.init(
+      rng,
+      jnp.zeros((1, t_len), dtype=jnp.float32),
+      jnp.zeros((1, t_len, cfg.n_coch_bins), dtype=jnp.float32),
+      jnp.zeros((1, t_len, cfg.n_coch_bins), dtype=jnp.float32),
+    )
+    init_params_host = tpu.to_host_tree(raw_params)
   params = cast(Mapping[str, Any], tpu.replicate_tree(init_params_host, mesh))
   n_params = sum(p.size for p in jax.tree_util.tree_leaves(params))
-  print(f"Initialized NapResidualRefiner with {n_params:,} parameters")
+  print(
+    f"Initialized NapResidualRefiner with {n_params:,} parameters", flush=True
+  )
 
   def _eval_and_loss(
     p: Mapping[str, Any],
@@ -1438,7 +1454,8 @@ def run_training(
   print(
     f"[step 0 / warm-start baseline] val_loss={init_val['total']:.4f}, "
     f"val_sisdr={init_val['sisdr_db']:.2f} dB, stft={init_val['stft']:.4f}, "
-    f"hf={init_val['hf_spec']:.4f}, log_rms={init_val['log_rms']:.4f}"
+    f"hf={init_val['hf_spec']:.4f}, log_rms={init_val['log_rms']:.4f}",
+    flush=True,
   )
   best_s1_loss = float(init_val["total"])
   best_s1_sisdr = float(init_val["sisdr_db"])
@@ -1456,7 +1473,9 @@ def run_training(
       optax.clip_by_global_norm(2.0),
       optax.adamw(learning_rate=sched1, weight_decay=3e-4),
     )
-    opt_state1 = tpu.replicate_tree(tx1.init(params), mesh)
+    with tpu.host_cpu_context():
+      opt_state1_host = tpu.to_host_tree(tx1.init(init_params_host))
+    opt_state1 = tpu.replicate_tree(opt_state1_host, mesh)
     s1_single, s1_multi = make_train_fns(tx1, use_carfac=False)
     t_s1 = time.perf_counter()
 
@@ -1484,7 +1503,8 @@ def run_training(
         f"tr={tr_m['total']:.4f} (sdr={tr_m['sisdr_db']:.2f}) | "
         f"va={val_m['total']:.4f} sdr={val_m['sisdr_db']:.2f}dB "
         f"stft={val_m['stft']:.4f} hf={val_m['hf_spec']:.4f} "
-        f"lrms={val_m['log_rms']:.4f}"
+        f"lrms={val_m['log_rms']:.4f}",
+        flush=True,
       )
       history.append({"stage": 1.0, "step": float(step_idx), **val_m})
 
@@ -1516,7 +1536,8 @@ def run_training(
 
     neural.save_refiner_checkpoint(stage1_path, best_s1_params_host, cfg)
     print(
-      f"Saved Stage 1 best checkpoint -> {stage1_path} (val={best_s1_loss:.4f})"
+      f"Saved Stage 1 best checkpoint -> {stage1_path} (val={best_s1_loss:.4f})",
+      flush=True,
     )
     tpu.delete_tree((params, opt_state1))
     gc.collect()
@@ -1544,7 +1565,8 @@ def run_training(
     )
     print(
       f"[S2 start] val_total={s2_init_val['total']:.4f} "
-      f"sdr={s2_init_val['sisdr_db']:.2f}dB nap={s2_init_val['carfac_nap']:.4f}"
+      f"sdr={s2_init_val['sisdr_db']:.2f}dB nap={s2_init_val['carfac_nap']:.4f}",
+      flush=True,
     )
     best_s2_loss = float(s2_init_val["total"])
     best_s2_sisdr = float(s2_init_val["sisdr_db"])
@@ -1558,7 +1580,9 @@ def run_training(
       optax.clip_by_global_norm(2.0),
       optax.adamw(learning_rate=sched2, weight_decay=3e-4),
     )
-    opt_state2 = tpu.replicate_tree(tx2.init(params), mesh)
+    with tpu.host_cpu_context():
+      opt_state2_host = tpu.to_host_tree(tx2.init(best_s1_params_host))
+    opt_state2 = tpu.replicate_tree(opt_state2_host, mesh)
     s2_single, s2_multi = make_train_fns(tx2, use_carfac=True)
     t_s2 = time.perf_counter()
     s2_eval_cadence = max(50, min(eval_every, max(50, stage2_steps // 4)))
@@ -1587,7 +1611,8 @@ def run_training(
         f"tr={tr_m['total']:.4f} nap={tr_m['carfac_nap']:.4f} | "
         f"va={val_m['total']:.4f} sdr={val_m['sisdr_db']:.2f}dB "
         f"nap={val_m['carfac_nap']:.4f} hf={val_m['hf_spec']:.4f} "
-        f"lrms={val_m['log_rms']:.4f}"
+        f"lrms={val_m['log_rms']:.4f}",
+        flush=True,
       )
       history.append({"stage": 2.0, "step": float(step_idx), **val_m})
 
@@ -1621,7 +1646,8 @@ def run_training(
   tpu.delete_tree(params)
   neural.save_refiner_checkpoint(out_path, best_s2_params_host, cfg)
   print(
-    f"Saved final checkpoint -> {out_path} ({out_path.stat().st_size / 1e6:.2f} MB)"
+    f"Saved final checkpoint -> {out_path} ({out_path.stat().st_size / 1e6:.2f} MB)",
+    flush=True,
   )
   return TrainingResult(
     best_stage1_val_loss=best_s1_loss,

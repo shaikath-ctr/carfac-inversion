@@ -38,6 +38,10 @@ class TpuUtilsTest(absltest.TestCase):
         compilation_cache.reset_cache()
         jax.config.update("jax_default_matmul_precision", "default")
 
+    with tpu.host_cpu_context():
+      arr = jnp.zeros((2, 2), dtype=jnp.float32)
+      self.assertEqual(arr.shape, (2, 2))
+
   def test_mesh_replicate_and_shard_batch(self):
     mesh = tpu.make_data_mesh()
     rep = tpu.replicated_sharding(mesh)

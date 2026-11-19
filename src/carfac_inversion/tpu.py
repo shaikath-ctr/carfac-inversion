@@ -1,5 +1,6 @@
 """TPU/MLCR runtime configuration, sharding, and multi-step scan utilities."""
 
+import contextlib
 import functools
 import os
 import pathlib
@@ -7,6 +8,7 @@ import queue
 import threading
 from collections.abc import Callable
 from collections.abc import Iterator
+from contextlib import AbstractContextManager
 from typing import Any
 from typing import TypeVar
 
@@ -96,6 +98,21 @@ def configure_runtime(
       pathlib.Path(compilation_cache_dir).mkdir(parents=True, exist_ok=True)
     compilation_cache.set_cache_dir(compilation_cache_dir)
   return str(jax.default_backend()), int(jax.device_count())
+
+
+def host_cpu_context() -> AbstractContextManager[Any]:
+  """Returns a local CPU default-device context when a CPU backend exists.
+
+  Avoids sending hundreds of eager small-tensor RPCs during model or cochlea
+  initialization when attached to a remote MLCR/Pathways TPU slice.
+  """
+  try:
+    cpu_devs = jax.devices("cpu")
+  except RuntimeError:
+    cpu_devs = []
+  if cpu_devs:
+    return jax.default_device(cpu_devs[0])
+  return contextlib.nullcontext()
 
 
 def make_data_mesh() -> jax.sharding.Mesh:

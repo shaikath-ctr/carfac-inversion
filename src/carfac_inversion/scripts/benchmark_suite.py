@@ -32,12 +32,12 @@ from hp_acoustic.io import audio_io
 from hp_acoustic.io import resampling
 from hp_acoustic.metrics import context as metric_context
 from hp_acoustic.metrics import perceptual
-from hp_acoustic.metrics import sii
 from hp_acoustic.metrics import waveform as waveform_metrics
 from hp_acoustic.models import carfac
 from hp_acoustic.models import sai as sai_lib
 from jax_haspi_hasqi import hasqi as hasqi_lib
 
+from carfac_inversion import arcfac_metrics
 from carfac_inversion import inversion
 
 
@@ -47,6 +47,26 @@ def _load_optional_module(name: str) -> Any | None:
     return importlib.import_module(name)
   except ImportError:
     return None
+
+
+_SII_MOD = _load_optional_module("hp_acoustic.metrics.sii")
+CARFAC_RMS_ONE_DB_SPL = (
+  float(_SII_MOD.CARFAC_RMS_ONE_DB_SPL)
+  if _SII_MOD is not None
+  else (104.0 + 20.0 * math.log10(math.sqrt(2.0)))
+)
+HALF_OHC_HEARING_LOSS_DB = np.asarray(
+  getattr(
+    perceptual,
+    "HALF_OHC_HEARING_LOSS_DB",
+    getattr(
+      perceptual,
+      "_HEARING_LOSS_DB",
+      (21.0, 26.0, 30.0, 32.0, 33.0, 33.0),
+    ),
+  ),
+  dtype=np.float64,
+)
 
 
 FLAGS = flags.FLAGS
@@ -288,7 +308,7 @@ def _scale_to_spl(audio: np.ndarray, level_db_spl: float) -> np.ndarray:
   rms = float(np.sqrt(np.mean(audio**2)))
   if rms <= 1e-12:
     return audio.astype(np.float32)
-  target_rms = 10.0 ** ((level_db_spl - sii.CARFAC_RMS_ONE_DB_SPL) / 20.0)
+  target_rms = 10.0 ** ((level_db_spl - CARFAC_RMS_ONE_DB_SPL) / 20.0)
   return (audio * (target_rms / rms)).astype(np.float32)
 
 
@@ -387,10 +407,11 @@ def _score_pair(
   est: np.ndarray,
   target_nap: np.ndarray,
   recon_nap: np.ndarray,
+  healthy_ref_nap: np.ndarray | None = None,
   sample_rate_hz: int,
   hearing_loss_db: np.ndarray,
 ) -> dict[str, float]:
-  """Scores waveform, perceptual, and auditory-domain fidelity."""
+  """Scores waveform, perceptual, auditory-domain, and ``arcfac`` fidelity."""
   common = min(len(ref), len(est))
   ref_c = ref[:common]
   est_c = est[:common]
@@ -416,7 +437,7 @@ def _score_pair(
         est_c,
         sample_rate_hz,
         hearing_loss_db,
-        level1=sii.CARFAC_RMS_ONE_DB_SPL,
+        level1=CARFAC_RMS_ONE_DB_SPL,
       )
       hasqi_nl = float(nl)
       hasqi_lin = float(lin)
@@ -460,6 +481,17 @@ def _score_pair(
     "sai_corr": sai_corr,
   }
   row.update(_band_snrs_db(ref_c, est_c, sample_rate_hz))
+  arc_scores = arcfac_metrics.score_arcfac(
+    ref_c,
+    est_c,
+    n_target=target_nap,
+    n_healthy_ref=(
+      healthy_ref_nap if healthy_ref_nap is not None else target_nap
+    ),
+    n_healthy_est=recon_nap,
+    sample_rate_hz=sample_rate_hz,
+  )
+  row.update(arcfac_metrics.flatten_arcfac_metrics(arc_scores))
   return row
 
 
@@ -718,11 +750,14 @@ def run_benchmark(
         audio_io.save_audio_to_file(
           sig_in, str(clip_audio_dir / f"source_{sig_tag}.wav"), fs
         )
+        healthy_nap_src = np.asarray(
+          healthy(jnp.asarray(sig_in[:, None]))[:, :, 0]
+        )
         for coch_tag, src_cochlea, hl_arr in (
           (
             "ohc05",
             impaired_half,
-            np.asarray(perceptual.HALF_OHC_HEARING_LOSS_DB, dtype=np.float64),
+            HALF_OHC_HEARING_LOSS_DB,
           ),
           ("sloping", impaired_sloping, np.zeros(6)),
         ):
@@ -769,6 +804,7 @@ def run_benchmark(
               est=res.waveform,
               target_nap=nap_src,
               recon_nap=res.reconstructed_nap,
+              healthy_ref_nap=healthy_nap_src,
               sample_rate_hz=fs,
               hearing_loss_db=hl_arr,
             )
