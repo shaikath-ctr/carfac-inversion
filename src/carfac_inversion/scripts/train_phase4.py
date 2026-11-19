@@ -1270,18 +1270,31 @@ def run_phase4_training(
     mpd = vocoder_losses.MultiPeriodDiscriminator()
     mrd = vocoder_losses.MultiResolutionDiscriminator(resolutions=stft_res)
     start_idx = max(mask_samples, lookahead)
+    gan_start = lookahead if num_samples - lookahead >= 2048 else 0
     with tpu.host_cpu_context():
       dk1, dk2 = jax.random.split(jax.random.PRNGKey(seed + 99))
       dummy_wav = jnp.zeros(
-        (1, max(2048, num_samples - start_idx)), dtype=jnp.float32
+        (1, max(2048, num_samples - gan_start)), dtype=jnp.float32
       )
       d_params_host = tpu.to_host_tree(
         {"mpd": mpd.init(dk1, dummy_wav), "mrd": mrd.init(dk2, dummy_wav)}
       )
     d_params = cast(Mapping[str, Any], tpu.replicate_tree(d_params_host, mesh))
+    warmup_g = min(50, max(1, gan_steps // 4))
+    g_sched: optax.Schedule | float = (
+      optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=gan_lr,
+        warmup_steps=warmup_g,
+        decay_steps=max(warmup_g + 1, gan_steps),
+        end_value=gan_lr * 0.1,
+      )
+      if gan_steps > 1
+      else gan_lr
+    )
     tx_g = optax.chain(
       optax.clip_by_global_norm(max(clip_norm, 1.0)),
-      optax.adam(gan_lr, b1=0.5, b2=0.9),
+      optax.adam(g_sched, b1=0.5, b2=0.9),
     )
     tx_d = optax.chain(
       optax.clip_by_global_norm(max(clip_norm, 1.0)),
@@ -1315,15 +1328,18 @@ def run_phase4_training(
         x_delayed: jnp.ndarray,
         y_fake: jnp.ndarray,
         clip_norm_rms: jnp.ndarray,
+        healthy_mask: jnp.ndarray,
       ) -> jnp.ndarray:
-        real_seg = x_delayed[:, start_idx:] / clip_norm_rms
-        fake_seg = y_fake[:, start_idx:] / clip_norm_rms
+        real_seg = x_delayed[:, gan_start:] / clip_norm_rms
+        fake_seg = y_fake[:, gan_start:] / clip_norm_rms
         return vocoder_losses.discriminator_loss(
           cast(Any, mpd.apply(d_p["mpd"], real_seg)),
           cast(Any, mpd.apply(d_p["mpd"], fake_seg)),
+          mask=healthy_mask,
         ) + vocoder_losses.discriminator_loss(
           cast(Any, mrd.apply(d_p["mrd"], real_seg)),
           cast(Any, mrd.apply(d_p["mrd"], fake_seg)),
+          mask=healthy_mask,
         )
 
       def _d_accum_body(
@@ -1333,13 +1349,14 @@ def run_phase4_training(
         ],
       ) -> tuple[
         tuple[jnp.ndarray, Mapping[str, Any]],
-        tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray],
+        tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
       ]:
         d_sum, dg_sum = carry_d
         x_b, ohc_b, shift_b, _, _ = micro
+        healthy_mask = (jnp.min(ohc_b, axis=1) > 0.999).astype(jnp.float32)
         tgt_nap = jax.lax.stop_gradient(target_naps_jit(x_b, ohc_b, shift_b))
         x_delayed = vocoder_losses.delay_samples(x_b, lookahead, axis=1)
-        # Normalize amplitude entering D so 30-95 dB levels contribute evenly.
+        # Normalize amplitude entering D using steady-state RMS across 30-95 dB.
         clip_norm_rms = jnp.maximum(
           jnp.sqrt(
             jnp.mean(x_delayed[:, start_idx:] ** 2, axis=1, keepdims=True)
@@ -1350,12 +1367,12 @@ def run_phase4_training(
           cast(jnp.ndarray, model.apply(gp, tgt_nap))
         )
         d_val_i, d_grad_i = jax.value_and_grad(_d_loss_micro)(
-          dp, x_delayed, y_fake, clip_norm_rms
+          dp, x_delayed, y_fake, clip_norm_rms, healthy_mask
         )
         return (
           d_sum + d_val_i,
           jax.tree.map(jnp.add, dg_sum, d_grad_i),
-        ), (tgt_nap, x_delayed, clip_norm_rms)
+        ), (tgt_nap, x_delayed, clip_norm_rms, healthy_mask)
 
       zero_d_grads = jax.tree.map(jnp.zeros_like, dp)
       (d_val_sum, d_grads_sum), cached = jax.lax.scan(
@@ -1374,6 +1391,7 @@ def run_phase4_training(
         stft_b: jnp.ndarray,
         x_delayed: jnp.ndarray,
         clip_norm_rms: jnp.ndarray,
+        healthy_mask: jnp.ndarray,
       ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
         y_b = cast(jnp.ndarray, model.apply(g_p, tgt_nap))
         base_loss, parts = vocoder_losses.compute_arcfac_inverter_loss(
@@ -1391,18 +1409,20 @@ def run_phase4_training(
           sai_weight=sai_weight,
           stft_resolutions=stft_res,
         )
-        real_seg = x_delayed[:, start_idx:] / clip_norm_rms
-        fake_seg = y_b[:, start_idx:] / clip_norm_rms
+        real_seg = x_delayed[:, gan_start:] / clip_norm_rms
+        fake_seg = y_b[:, gan_start:] / clip_norm_rms
         real_m = cast(Any, mpd.apply(new_dp["mpd"], real_seg))
         fake_m = cast(Any, mpd.apply(new_dp["mpd"], fake_seg))
         real_r = cast(Any, mrd.apply(new_dp["mrd"], real_seg))
         fake_r = cast(Any, mrd.apply(new_dp["mrd"], fake_seg))
         adv = vocoder_losses.generator_loss(
-          fake_m
-        ) + vocoder_losses.generator_loss(fake_r)
+          fake_m, mask=healthy_mask
+        ) + vocoder_losses.generator_loss(fake_r, mask=healthy_mask)
         fm = vocoder_losses.feature_matching_loss(
-          real_m, fake_m
-        ) + vocoder_losses.feature_matching_loss(real_r, fake_r)
+          real_m, fake_m, mask=healthy_mask
+        ) + vocoder_losses.feature_matching_loss(
+          real_r, fake_r, mask=healthy_mask
+        )
         total = base_loss + gan_weight * (adv + fm_weight * fm)
         return total, {**parts, "adv": adv, "fm": fm, "d_loss": d_val}
 
@@ -1428,14 +1448,31 @@ def run_phase4_training(
           tuple[
             jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray
           ],
-          tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray],
+          tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
         ],
       ) -> tuple[tuple[Mapping[str, Any], dict[str, jnp.ndarray]], None]:
         gg_acc, gm_acc = carry_g
-        (x_b, _, _, lam_b, stft_b), (tgt_nap, x_delayed, clip_norm_rms) = item
+        (
+          (x_b, _, _, lam_b, stft_b),
+          (
+            tgt_nap,
+            x_delayed,
+            clip_norm_rms,
+            healthy_mask,
+          ),
+        ) = item
         (g_val_i, g_parts_i), g_grad_i = jax.value_and_grad(
           _g_loss_micro, has_aux=True
-        )(gp, x_b, tgt_nap, lam_b, stft_b, x_delayed, clip_norm_rms)
+        )(
+          gp,
+          x_b,
+          tgt_nap,
+          lam_b,
+          stft_b,
+          x_delayed,
+          clip_norm_rms,
+          healthy_mask,
+        )
         step_gm = {"loss": g_val_i, **g_parts_i}
         return (
           jax.tree.map(jnp.add, gg_acc, g_grad_i),
@@ -1479,6 +1516,7 @@ def run_phase4_training(
       batch_iter, mesh, steps_per_loop=gan_scan_k, max_prefetch=2
     ) as g_pre:
       while g_step < gan_steps:
+        t0 = time.perf_counter()
         rem = gan_steps - g_step
         if rem >= gan_scan_k:
           chunk = next(g_pre)
@@ -1492,18 +1530,20 @@ def run_phase4_training(
           gan_state, gm_dev = gan_k_jit(gan_state, sh)
           c_len = 1
         g_step += c_len
+        dt = time.perf_counter() - t0
         last_metrics = {k: float(np.asarray(v)[-1]) for k, v in gm_dev.items()}
         print(
           f"[Phase 4 GAN {g_step:4d}/{gan_steps}] loss={last_metrics['loss']:.5g} "
           f"nap={last_metrics['nap_l1']:.5g} adv={last_metrics['adv']:.4g} "
-          f"d={last_metrics['d_loss']:.4g}",
+          f"fm={last_metrics['fm']:.4g} d={last_metrics['d_loss']:.4g} ({dt:.2f}s)",
           flush=True,
         )
     params = gan_state[0]
-    best_params_host = tpu.to_host_tree(params)
+    gan_params_host = tpu.to_host_tree(params)
     tpu.delete_tree(gan_state[1:])
-    nap_inverter.save_direct_checkpoint(ckpt_path, best_params_host, cfg)
-    best_scores = _evaluate_phase4(
+    gan_ckpt = out_root / "checkpoint_gan.npz"
+    nap_inverter.save_direct_checkpoint(gan_ckpt, gan_params_host, cfg)
+    gan_scores = _evaluate_phase4(
       apply_fn=apply_jit,
       params=params,
       eval_clips=eval_clips,
@@ -1516,7 +1556,16 @@ def run_phase4_training(
       step_idx=steps + gan_steps,
       mesh=mesh,
     )
-    print(f"[Phase 4 GAN eval] {json.dumps(best_scores)}", flush=True)
+    print(f"[Phase 4 GAN eval] {json.dumps(gan_scores)}", flush=True)
+    if np.isfinite(gan_scores["selection_loss"]) and (
+      steps == 0
+      or not np.isfinite(best_sel_loss)
+      or gan_scores["selection_loss"] <= best_sel_loss
+    ):
+      best_sel_loss = float(gan_scores["selection_loss"])
+      best_scores = gan_scores
+      best_params_host = gan_params_host
+      nap_inverter.save_direct_checkpoint(ckpt_path, best_params_host, cfg)
 
   return {
     "checkpoint_path": str(ckpt_path),

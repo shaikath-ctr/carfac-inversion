@@ -65,6 +65,7 @@ class TrainPhase4Test(absltest.TestCase):
       ckpt = pathlib.Path(res["checkpoint_path"])
       self.assertTrue(ckpt.is_file())
       self.assertTrue((out_dir / "checkpoint_stage1.npz").is_file())
+      self.assertTrue((out_dir / "checkpoint_gan.npz").is_file())
       self.assertTrue((out_dir / "config.json").is_file())
       self.assertTrue((out_dir / "log.csv").is_file())
       self.assertTrue((out_dir / "scores" / "step0.json").is_file())

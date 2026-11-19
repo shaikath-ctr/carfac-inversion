@@ -23,6 +23,7 @@ from hp_acoustic.io import audio_io
 from hp_acoustic.models import carfac
 
 from carfac_inversion import arcfac_metrics
+from carfac_inversion import clinical
 from carfac_inversion import inversion
 from carfac_inversion import nap_inverter
 from carfac_inversion import neural
@@ -245,6 +246,23 @@ def _build_target_cochlea(
   """Builds target ``CarfacCochleaModel`` and HASPI/HASQI audiogram array."""
   if spec == "healthy":
     return healthy, np.zeros(6, dtype=np.float64)
+  low = spec.strip().lower()
+  if (
+    low.startswith("bisgaard:")
+    or low.startswith("iso7029:")
+    or spec.strip().upper() in clinical.BISGAARD_AUDIOGRAMS_DB_HL
+  ):
+    prof = clinical.build_clinical_profile(
+      spec,
+      sample_rate_hz=float(sample_rate_hz),
+      channel_freqs_hz=np.asarray(
+        healthy.channel_frequencies, dtype=np.float32
+      ),
+    )
+    return (
+      clinical.build_cochlea_from_profile(prof),
+      np.asarray(prof.audiogram_6_db_hl, dtype=np.float64),
+    )
   if spec == "sloping":
     return (
       carfac.build(

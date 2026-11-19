@@ -2,6 +2,7 @@
 
 from typing import cast
 
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -85,6 +86,81 @@ class VocoderLossesTest(absltest.TestCase):
     self.assertTrue(np.isfinite(float(d_loss)))
     self.assertTrue(np.isfinite(float(g_loss)))
     self.assertGreater(float(fm_loss), 0.0)
+
+    mask = jnp.array([1.0, 0.0], dtype=jnp.float32)
+    masked_d = vocoder_losses.discriminator_loss(real_m, fake_m, mask=mask)
+    masked_g = vocoder_losses.generator_loss(fake_m, mask=mask)
+    masked_fm = vocoder_losses.feature_matching_loss(real_m, fake_m, mask=mask)
+    zero_d = vocoder_losses.discriminator_loss(
+      real_m, fake_m, mask=jnp.zeros((2,), dtype=jnp.float32)
+    )
+    self.assertTrue(np.isfinite(float(masked_d)))
+    self.assertTrue(np.isfinite(float(masked_g)))
+    self.assertGreater(float(masked_fm), 0.0)
+    self.assertEqual(float(zero_d), 0.0)
+
+  def test_period_discriminator_matches_2d_conv(self):
+    rng = np.random.default_rng(7)
+    x = jnp.asarray(0.1 * rng.standard_normal((2, 128)), dtype=jnp.float32)
+    period = 5
+    channels = (4, 8)
+    disc = vocoder_losses.PeriodDiscriminator(
+      period=period, channels=channels, kernel=5, stride=3
+    )
+    params = disc.init(jax.random.PRNGKey(3), x)
+    got_logits, got_feats = cast(
+      tuple[jnp.ndarray, list[jnp.ndarray]], disc.apply(params, x)
+    )
+
+    p_map = params["params"]
+    extra = (-x.shape[1]) % period
+    x_pad = jnp.pad(x, ((0, 0), (0, extra)), mode="reflect") if extra else x
+    h = x_pad.reshape(x.shape[0], -1, period, 1)
+    ref_feats: list[jnp.ndarray] = []
+    layer_idx = 0
+    for ch in channels:
+      lp = p_map[f"Conv_{layer_idx}"]
+      k2d = lp["kernel"][:, None, :, :]
+      h = cast(
+        jnp.ndarray,
+        nn.Conv(ch, (5, 1), strides=(3, 1)).apply(
+          {"params": {"kernel": k2d, "bias": lp["bias"]}}, h
+        ),
+      )
+      h = nn.leaky_relu(h, vocoder_losses._DISCRIMINATOR_LEAK)
+      ref_feats.append(h)
+      layer_idx += 1
+    lp = p_map[f"Conv_{layer_idx}"]
+    h = cast(
+      jnp.ndarray,
+      nn.Conv(channels[-1], (5, 1)).apply(
+        {"params": {"kernel": lp["kernel"][:, None, :, :], "bias": lp["bias"]}},
+        h,
+      ),
+    )
+    h = nn.leaky_relu(h, vocoder_losses._DISCRIMINATOR_LEAK)
+    ref_feats.append(h)
+    lp_out = p_map[f"Conv_{layer_idx + 1}"]
+    ref_logits = cast(
+      jnp.ndarray,
+      nn.Conv(1, (3, 1)).apply(
+        {
+          "params": {
+            "kernel": lp_out["kernel"][:, None, :, :],
+            "bias": lp_out["bias"],
+          }
+        },
+        h,
+      ),
+    ).reshape(x.shape[0], -1)
+
+    np.testing.assert_allclose(
+      np.asarray(got_logits), np.asarray(ref_logits), atol=1e-5, rtol=1e-5
+    )
+    for got_f, ref_f in zip(got_feats, ref_feats, strict=True):
+      np.testing.assert_allclose(
+        np.asarray(got_f), np.asarray(ref_f), atol=1e-5, rtol=1e-5
+      )
 
   def test_arcfac_inverter_loss_respects_healthy_only_masking(self):
     rng = np.random.default_rng(2)

@@ -71,6 +71,12 @@ class NapInverterTest(parameterized.TestCase):
       self.assertEqual(out_2d.shape, (320,))
       self.assertTrue(np.all(np.isfinite(out_2d)))
 
+      out_pre = nap_inverter.invert_nap_direct(
+        nap, ckpt, align_lookahead=True, preroll_samples=32
+      )
+      self.assertEqual(out_pre.shape, (320,))
+      self.assertTrue(np.all(np.isfinite(out_pre)))
+
       nap_stereo = np.stack([nap, 0.5 * nap], axis=-1)
       out_3d = nap_inverter.invert_nap_direct(
         nap_stereo, ckpt, align_lookahead=False
@@ -106,6 +112,51 @@ class NapInverterTest(parameterized.TestCase):
       nn.Dense(8).apply({"params": p["Dense_0"]}, h.reshape((2, 24, 15 * 4)))
     )
     np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-5)
+
+  def test_conditioned_warmstart_equivalence_and_causality(self):
+    base_cfg = nap_inverter.DirectInverterConfig(
+      architecture="cochlea_hybrid",
+      width=16,
+      num_blocks=3,
+      coarse_dim=16,
+      coarse_hop=32,
+      coarse_dilations=(1, 2),
+      lookahead=32,
+      fs=16000.0,
+      conditioned=False,
+    )
+    cond_cfg = nap_inverter.DirectInverterConfig(
+      architecture="cochlea_hybrid",
+      width=16,
+      num_blocks=3,
+      coarse_dim=16,
+      coarse_hop=32,
+      coarse_dilations=(1, 2),
+      lookahead=32,
+      fs=16000.0,
+      conditioned=True,
+      cond_dim=3,
+      max_log_gain=4.5,
+    )
+    rng = np.random.default_rng(11)
+    nap = jnp.asarray(0.05 * rng.standard_normal((2, 256, 8)), jnp.float32)
+    cond = jnp.asarray(rng.uniform(0.0, 1.0, (2, 8, 3)), jnp.float32)
+
+    base_model = nap_inverter.CochleaDirectInverter(config=base_cfg)
+    cond_model = nap_inverter.CochleaDirectInverter(config=cond_cfg)
+    base_params = base_model.init(jax.random.PRNGKey(0), nap[:1])
+    init_cond = cond_model.init(jax.random.PRNGKey(1), nap[:1], cond=cond[:1])
+    merged = nap_inverter.merge_warmstart_params(init_cond, base_params)
+
+    y_base = np.asarray(base_model.apply(base_params, nap))
+    y_merged = np.asarray(cond_model.apply(merged, nap, cond=cond))
+    np.testing.assert_allclose(y_merged, y_base, atol=1e-5, rtol=1e-5)
+
+    nap_fut = nap.at[:, 128:, :].set(nap[:, 128:, :] + 0.4)
+    y_fut = np.asarray(cond_model.apply(merged, nap_fut, cond=cond))
+    np.testing.assert_allclose(
+      y_merged[:, :128], y_fut[:, :128], atol=1e-6, rtol=1e-6
+    )
 
 
 if __name__ == "__main__":

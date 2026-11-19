@@ -23,9 +23,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import traverse_util
+from hp_acoustic.models import carfac
 from hp_acoustic.models import cochlea
 
+from carfac_inversion import clinical
 from carfac_inversion import neural
+from carfac_inversion import tpu
 from carfac_inversion import vocoder_losses
 
 
@@ -46,6 +49,9 @@ class DirectInverterConfig:
   output_highpass_hz: float = 20.0
   fs: float = 32000.0
   nap_log_scale: float = 0.02
+  conditioned: bool = False
+  cond_dim: int = 3
+  max_log_gain: float = 2.5
 
   def __post_init__(self) -> None:
     """Validates architectural hyperparameters."""
@@ -59,6 +65,8 @@ class DirectInverterConfig:
       raise ValueError(f"lookahead must be non-negative, got {self.lookahead}.")
     if self.coarse_hop < 1:
       raise ValueError(f"coarse_hop must be positive, got {self.coarse_hop}.")
+    if self.cond_dim < 1 or self.max_log_gain <= 0.0:
+      raise ValueError("cond_dim and max_log_gain must be positive.")
 
   @property
   def receptive_field(self) -> int:
@@ -245,13 +253,31 @@ class CochleaDirectInverter(nn.Module):
   )
 
   @nn.compact
-  def __call__(self, nap: jnp.ndarray) -> jnp.ndarray:
+  def __call__(
+    self, nap: jnp.ndarray, cond: jnp.ndarray | None = None
+  ) -> jnp.ndarray:
     """Inverts centered/raw cochleotopic NAP ``(batch, samples, ch)`` to audio."""
     cfg = self.config
     nap_scaled = nap / max(float(cfg.input_scale), 1e-8)
+    cond_flat: jnp.ndarray | None = None
+    if cfg.conditioned:
+      batch, _, n_ch = nap.shape
+      if cond is None:
+        cond = jnp.zeros((batch, n_ch, cfg.cond_dim), dtype=nap.dtype)
+      cond_flat = cond.reshape((batch, n_ch * cfg.cond_dim))
 
     if cfg.architecture == "tcn":
       h = _CausalConv1D(cfg.width, cfg.kernel_size)(nap_scaled)
+      if cond_flat is not None:
+        h = (
+          h
+          + nn.Dense(
+            cfg.width,
+            use_bias=False,
+            kernel_init=nn.initializers.zeros_init(),
+            name="cond_stem",
+          )(cond_flat)[:, None, :]
+        )
       for block in range(cfg.num_blocks):
         h = _RematTcnBlock(
           width=cfg.width, kernel_size=cfg.kernel_size, dilation=2**block
@@ -263,13 +289,23 @@ class CochleaDirectInverter(nn.Module):
         )
       return y
 
-    # Phase 4 cochlea_hybrid:
+    # Phase 4/5 cochlea_hybrid:
     # 1) Dual linear + log-compressed input so 30-95 dB SPL stay well-scaled.
     t_len = nap.shape[1]
     nap_log = jnp.sign(nap) * jnp.log1p(jnp.abs(nap) / cfg.nap_log_scale)
     nap_dual = jnp.stack([nap_scaled, nap_log], axis=-1)
 
     h_stem = _RematTonotopicStem(width=cfg.width)(nap_dual)
+    if cond_flat is not None:
+      h_stem = (
+        h_stem
+        + nn.Dense(
+          cfg.width,
+          use_bias=False,
+          kernel_init=nn.initializers.zeros_init(),
+          name="cond_stem",
+        )(cond_flat)[:, None, :]
+      )
 
     # 2) Strictly causal coarse frame-rate AGC / envelope branch (2 ms @ 32 kHz).
     #    Frame f looks only at sample <= f * hop <= t for t in [f*hop, (f+1)*hop).
@@ -287,6 +323,16 @@ class CochleaDirectInverter(nn.Module):
       padding="VALID",
     )(x_coarse_pad)
     c_feat = nn.gelu(nn.Dense(cfg.coarse_dim)(c_feat))
+    if cond_flat is not None:
+      c_feat = (
+        c_feat
+        + nn.Dense(
+          cfg.coarse_dim,
+          use_bias=False,
+          kernel_init=nn.initializers.zeros_init(),
+          name="cond_coarse",
+        )(cond_flat)[:, None, :]
+      )
     for dil in cfg.coarse_dilations:
       c_res = c_feat
       c_y = nn.LayerNorm(epsilon=1e-5)(c_feat)
@@ -320,11 +366,21 @@ class CochleaDirectInverter(nn.Module):
       kernel_init=nn.initializers.zeros_init(),
       bias_init=nn.initializers.zeros_init(),
     )(c_up)[..., 0]
-    gain_t = jnp.exp(jnp.clip(log_gain_t, -2.5, 2.5))
+    gain_t = jnp.exp(jnp.clip(log_gain_t, -2.5, float(cfg.max_log_gain)))
 
     # 3) Sample-rate causal dilated TCN conditioned dynamically by coarse AGC branch.
     film_proj = nn.Dense(2 * cfg.width)(c_up)
     film_scale, film_shift = jnp.split(film_proj, 2, axis=-1)
+    if cond_flat is not None:
+      cond_film = nn.Dense(
+        2 * cfg.width,
+        use_bias=False,
+        kernel_init=nn.initializers.zeros_init(),
+        name="cond_film",
+      )(cond_flat)[:, None, :]
+      cf_scale, cf_shift = jnp.split(cond_film, 2, axis=-1)
+      film_scale = film_scale + cf_scale
+      film_shift = film_shift + cf_shift
     film_mul = 1.0 + 0.5 * jnp.tanh(film_scale)
 
     h = h_stem
@@ -389,13 +445,48 @@ def load_direct_checkpoint(
   return _load_direct_cached(str(p), p.stat().st_mtime_ns)
 
 
+def merge_warmstart_params(
+  init_params: Mapping[str, Any],
+  warmstart_params: Mapping[str, Any],
+) -> dict[str, Any]:
+  """Copies shape-matched weights from ``warmstart_params`` into ``init_params``."""
+  flat_init = cast(
+    dict[str, Any], traverse_util.flatten_dict(init_params, sep="/")
+  )
+  flat_warm = cast(
+    dict[str, Any], traverse_util.flatten_dict(warmstart_params, sep="/")
+  )
+  merged = {
+    k: (flat_warm[k] if k in flat_warm and flat_warm[k].shape == v.shape else v)
+    for k, v in flat_init.items()
+  }
+  return traverse_util.unflatten_dict(merged, sep="/")
+
+
 @functools.partial(jax.jit, static_argnames=("model",))
 def _apply_direct_jit(
   model: CochleaDirectInverter,
   params: Mapping[str, Any],
   nap: jnp.ndarray,
+  cond: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
-  return cast(jnp.ndarray, model.apply(params, nap))
+  return cast(jnp.ndarray, model.apply(params, nap, cond=cond))
+
+
+@functools.lru_cache(maxsize=4)
+def _default_healthy_cochlea(sample_rate_hz: int) -> carfac.CarfacCochleaModel:
+  with tpu.host_cpu_context():
+    return carfac.build(fs=sample_rate_hz)
+
+
+def _resting_nap_frame(cochlea_model: cochlea.CochleaModel) -> np.ndarray:
+  """Returns a ``(1, 1, channels)`` resting-silence NAP frame for ``cochlea_model``."""
+
+  def _eval(cm: cochlea.CochleaModel) -> jnp.ndarray:
+    return cm(jnp.zeros((64, 1), dtype=jnp.float32))[-1:, :, 0]
+
+  frame = np.asarray(jax.jit(_eval)(cochlea_model), dtype=np.float32)
+  return frame[None, :, :]
 
 
 def invert_nap_direct(
@@ -403,6 +494,8 @@ def invert_nap_direct(
   checkpoint_path: str | pathlib.Path,
   *,
   align_lookahead: bool = True,
+  preroll_samples: int = 0,
+  cond: np.ndarray | jnp.ndarray | None = None,
   cochlea_model: cochlea.CochleaModel | None = None,
 ) -> np.ndarray:
   """Inverts ``target_nap`` directly in a single causal pass using Phase 4 weights.
@@ -414,12 +507,20 @@ def invert_nap_direct(
     align_lookahead: When ``True``, pads input by ``config.lookahead`` trailing
       resting/zero samples and trims the leading ``lookahead`` samples so the
       returned waveform aligns sample-for-sample with the target timeline.
-    cochlea_model: Optional cochlea used strictly to validate channel/rate
-      alignment or fill trailing resting NAP padding when aligning lookahead.
+    preroll_samples: Optional leading silence/resting frames prepended before
+      inference and trimmed from the returned waveform to warm up causal state.
+    cond: Optional listener conditioning ``(channels, cond_dim)`` or
+      ``(channels, cond_dim, ears)`` used when ``config.conditioned`` is True.
+    cochlea_model: Optional cochlea used to validate channel/rate alignment and
+      supply the resting-silence NAP frame when ``preroll_samples > 0``.
 
   Returns:
     Reconstructed audio waveform matching input time length and ear count.
   """
+  if preroll_samples < 0:
+    raise ValueError(
+      f"preroll_samples must be non-negative, got {preroll_samples}."
+    )
   model, params, cfg = load_direct_checkpoint(checkpoint_path)
   if (
     cochlea_model is not None
@@ -434,18 +535,86 @@ def invert_nap_direct(
   nap_3d = nap_np[:, :, None] if is_2d else nap_np
   if nap_3d.ndim != 3:
     raise ValueError(f"target_nap must be 2D or 3D, got shape {nap_np.shape}.")
-  t_len, _, _ = nap_3d.shape
+  t_len, n_ch, _ = nap_3d.shape
   batch_nap = np.transpose(nap_3d, (2, 0, 1))
+  parts: list[np.ndarray] = []
+  if preroll_samples > 0:
+    if cochlea_model is not None:
+      rest = _resting_nap_frame(cochlea_model)
+      preroll = np.broadcast_to(
+        rest, (batch_nap.shape[0], preroll_samples, n_ch)
+      )
+    else:
+      preroll = np.zeros(
+        (batch_nap.shape[0], preroll_samples, n_ch), dtype=np.float32
+      )
+    parts.append(preroll)
+  parts.append(batch_nap)
   if align_lookahead and cfg.lookahead > 0:
-    tail = np.repeat(batch_nap[:, -1:, :], cfg.lookahead, axis=1)
-    batch_in = np.concatenate([batch_nap, tail], axis=1)
-  else:
-    batch_in = batch_nap
+    parts.append(np.repeat(batch_nap[:, -1:, :], cfg.lookahead, axis=1))
+  batch_in = parts[0] if len(parts) == 1 else np.concatenate(parts, axis=1)
+
+  cond_j: jnp.ndarray | None = None
+  if cfg.conditioned:
+    if cond is None:
+      cond_arr = np.zeros(
+        (batch_nap.shape[0], n_ch, cfg.cond_dim), dtype=np.float32
+      )
+    else:
+      cond_raw = np.asarray(cond, dtype=np.float32)
+      if cond_raw.ndim == 2:
+        cond_arr = np.broadcast_to(
+          cond_raw[None, :, :], (batch_nap.shape[0], *cond_raw.shape)
+        )
+      elif cond_raw.ndim == 3:
+        cond_arr = np.transpose(cond_raw, (2, 0, 1))
+      else:
+        raise ValueError(f"cond must be 2D or 3D, got shape {cond_raw.shape}.")
+    cond_j = jnp.asarray(cond_arr, dtype=jnp.float32)
+
   y_batch = np.asarray(
-    _apply_direct_jit(model, params, jnp.asarray(batch_in, dtype=jnp.float32)),
+    _apply_direct_jit(
+      model, params, jnp.asarray(batch_in, dtype=jnp.float32), cond_j
+    ),
     dtype=np.float32,
   )
-  start = cfg.lookahead if align_lookahead and cfg.lookahead > 0 else 0
+  start = preroll_samples + (
+    cfg.lookahead if align_lookahead and cfg.lookahead > 0 else 0
+  )
   y_aligned = y_batch[:, start : start + t_len]
   out_2d = np.transpose(y_aligned, (1, 0))
   return out_2d[:, 0] if is_2d else out_2d
+
+
+def prescribe_audio_direct(
+  audio: np.ndarray,
+  profile: clinical.ClinicalListenerProfile,
+  checkpoint_path: str | pathlib.Path,
+  *,
+  healthy_cochlea: cochlea.CochleaModel | None = None,
+  align_lookahead: bool = True,
+  mpo_clip: float = 0.99,
+) -> np.ndarray:
+  """Prescribes causal aided audio for ``profile`` from clean/noisy input."""
+  wav = np.asarray(audio, dtype=np.float32)
+  if wav.ndim != 1:
+    raise ValueError(f"Expected 1D audio array, got shape {wav.shape}.")
+  cm = (
+    healthy_cochlea
+    if healthy_cochlea is not None
+    else _default_healthy_cochlea(int(round(profile.sample_rate_hz)))
+  )
+  healthy_nap = np.asarray(
+    jax.jit(lambda w: cm(w[:, None])[:, :, 0])(jnp.asarray(wav, jnp.float32)),
+    dtype=np.float32,
+  )
+  aided = invert_nap_direct(
+    healthy_nap,
+    checkpoint_path,
+    align_lookahead=align_lookahead,
+    cond=profile.conditioning_features(),
+    cochlea_model=cm,
+  )
+  if mpo_clip > 0.0:
+    aided = np.clip(aided, -float(mpo_clip), float(mpo_clip))
+  return aided.astype(np.float32)

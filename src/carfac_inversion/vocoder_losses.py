@@ -203,10 +203,10 @@ def multi_resolution_stft_loss(
 
 
 class PeriodDiscriminator(nn.Module):
-  """HiFi-GAN period sub-discriminator operating on folded waveform slices."""
+  """HiFi-GAN period sub-discriminator lowered to 1D NWC convolutions."""
 
   period: int
-  channels: Sequence[int] = (32, 128, 512, 1024)
+  channels: Sequence[int] = (32, 64, 128, 256)
   kernel: int = 5
   stride: int = 3
 
@@ -217,16 +217,26 @@ class PeriodDiscriminator(nn.Module):
     extra = (-samples) % self.period
     if extra:
       x = jnp.pad(x, ((0, 0), (0, extra)), mode="reflect")
-    h = x.reshape(batch, -1, self.period, 1)
+    t_folded = x.shape[1] // self.period
+    # Keep batch outermost so folded periods can run via TPU-friendly 1D convs.
+    h = jnp.transpose(x.reshape(batch, t_folded, self.period), (0, 2, 1))
+    h = h.reshape(batch * self.period, t_folded, 1)
+
+    def _to_period_map(act: jnp.ndarray, ch: int) -> jnp.ndarray:
+      return jnp.transpose(
+        act.reshape(batch, self.period, -1, ch), (0, 2, 1, 3)
+      )
+
     features: list[jnp.ndarray] = []
     for ch in self.channels:
-      h = nn.Conv(ch, (self.kernel, 1), strides=(self.stride, 1))(h)
+      h = nn.Conv(ch, (self.kernel,), strides=(self.stride,))(h)
       h = nn.leaky_relu(h, _DISCRIMINATOR_LEAK)
-      features.append(h)
-    h = nn.Conv(self.channels[-1], (self.kernel, 1))(h)
+      features.append(_to_period_map(h, ch))
+    last_ch = self.channels[-1]
+    h = nn.Conv(last_ch, (self.kernel,))(h)
     h = nn.leaky_relu(h, _DISCRIMINATOR_LEAK)
-    features.append(h)
-    logits = nn.Conv(1, (3, 1))(h)
+    features.append(_to_period_map(h, last_ch))
+    logits = _to_period_map(nn.Conv(1, (3,))(h), 1)
     return logits.reshape(batch, -1), features
 
 
@@ -234,7 +244,7 @@ class MultiPeriodDiscriminator(nn.Module):
   """HiFi-GAN Multi-Period Discriminator across prime folding periods."""
 
   periods: Sequence[int] = DISCRIMINATOR_PERIODS
-  channels: Sequence[int] = (32, 128, 512, 1024)
+  channels: Sequence[int] = (32, 64, 128, 256)
 
   @nn.compact
   def __call__(
@@ -248,7 +258,7 @@ class MultiPeriodDiscriminator(nn.Module):
 
 
 class ResolutionDiscriminator(nn.Module):
-  """UnivNet/Vocos 2D linear-STFT magnitude sub-discriminator."""
+  """Linear-STFT magnitude sub-discriminator using 1D temporal NWC convs."""
 
   n_fft: int
   hop: int
@@ -258,19 +268,21 @@ class ResolutionDiscriminator(nn.Module):
 
   @nn.compact
   def __call__(self, x: jnp.ndarray) -> tuple[jnp.ndarray, list[jnp.ndarray]]:
-    """Returns flattened logits and feature maps over linear STFT bins."""
+    """Returns flattened logits and feature maps over STFT spectral frames."""
     batch = x.shape[0]
-    h = stft_magnitude(x, self.n_fft, self.hop, self.win_length)[..., None]
+    h = stft_magnitude(x, self.n_fft, self.hop, self.win_length)
+    hidden = max(1, self.channels * 4)
+    mid = max(1, self.channels * 2)
     features: list[jnp.ndarray] = []
-    h = nn.leaky_relu(nn.Conv(self.channels, (3, 9))(h), _DISCRIMINATOR_LEAK)
+    h = nn.leaky_relu(nn.Conv(hidden, (3,))(h), _DISCRIMINATOR_LEAK)
     features.append(h)
     for _ in range(self.num_strided):
-      h = nn.Conv(self.channels, (3, 9), strides=(1, 2))(h)
+      h = nn.Conv(hidden, (5,), strides=(2,))(h)
       h = nn.leaky_relu(h, _DISCRIMINATOR_LEAK)
       features.append(h)
-    h = nn.leaky_relu(nn.Conv(self.channels, (3, 3))(h), _DISCRIMINATOR_LEAK)
+    h = nn.leaky_relu(nn.Conv(mid, (3,))(h), _DISCRIMINATOR_LEAK)
     features.append(h)
-    logits = nn.Conv(1, (3, 3))(h)
+    logits = nn.Conv(1, (3,))(h)
     return logits.reshape(batch, -1), features
 
 
@@ -293,30 +305,50 @@ class MultiResolutionDiscriminator(nn.Module):
     ]
 
 
+def _masked_batch_mean(
+  per_example: jnp.ndarray, mask: jnp.ndarray | None
+) -> jnp.ndarray:
+  if mask is None:
+    return jnp.mean(per_example)
+  w = jnp.asarray(mask, dtype=jnp.float32)
+  return jnp.sum(per_example * w) / jnp.maximum(jnp.sum(w), 1.0)
+
+
 def discriminator_loss(
   real_outputs: Sequence[tuple[jnp.ndarray, Sequence[jnp.ndarray]]],
   fake_outputs: Sequence[tuple[jnp.ndarray, Sequence[jnp.ndarray]]],
+  *,
+  mask: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
   """Computes least-squares GAN discriminator loss summed across heads."""
   total = jnp.float32(0.0)
   for (r_log, _), (f_log, _) in zip(real_outputs, fake_outputs, strict=True):
-    total = total + jnp.mean((r_log - 1.0) ** 2) + jnp.mean(f_log**2)
+    b = r_log.shape[0]
+    r_per = jnp.mean(((r_log - 1.0) ** 2).reshape(b, -1), axis=1)
+    f_per = jnp.mean((f_log**2).reshape(b, -1), axis=1)
+    total = total + _masked_batch_mean(r_per + f_per, mask)
   return total
 
 
 def generator_loss(
   fake_outputs: Sequence[tuple[jnp.ndarray, Sequence[jnp.ndarray]]],
+  *,
+  mask: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
   """Computes least-squares GAN generator adversarial loss."""
   total = jnp.float32(0.0)
   for f_log, _ in fake_outputs:
-    total = total + jnp.mean((f_log - 1.0) ** 2)
+    b = f_log.shape[0]
+    f_per = jnp.mean(((f_log - 1.0) ** 2).reshape(b, -1), axis=1)
+    total = total + _masked_batch_mean(f_per, mask)
   return total
 
 
 def feature_matching_loss(
   real_outputs: Sequence[tuple[jnp.ndarray, Sequence[jnp.ndarray]]],
   fake_outputs: Sequence[tuple[jnp.ndarray, Sequence[jnp.ndarray]]],
+  *,
+  mask: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
   """Computes HiFi-GAN L1 hidden-feature matching loss with fixed targets."""
   total = jnp.float32(0.0)
@@ -324,7 +356,11 @@ def feature_matching_loss(
     real_outputs, fake_outputs, strict=True
   ):
     for real_f, fake_f in zip(r_feats, f_feats, strict=True):
-      total = total + jnp.mean(jnp.abs(jax.lax.stop_gradient(real_f) - fake_f))
+      b = real_f.shape[0]
+      fm_per = jnp.mean(
+        jnp.abs(jax.lax.stop_gradient(real_f) - fake_f).reshape(b, -1), axis=1
+      )
+      total = total + _masked_batch_mean(fm_per, mask)
   return total
 
 
@@ -376,23 +412,41 @@ def compute_arcfac_inverter_loss(
 
   nap_y = healthy_ear_fn(y)
   tgt_delayed = delay_samples(nap_target, lookahead, axis=1)
-  nap_per_clip = jnp.mean(
+  nap_steady = jnp.mean(
     jnp.abs(nap_y[:, start:] - tgt_delayed[:, start:]), axis=(1, 2)
   )
+  if start > lookahead:
+    nap_onset = jnp.mean(
+      jnp.abs(nap_y[:, lookahead:start] - tgt_delayed[:, lookahead:start]),
+      axis=(1, 2),
+    )
+    nap_total = nap_steady + 0.25 * nap_onset
+  else:
+    nap_total = nap_steady
 
   x_delayed = delay_samples(x, lookahead, axis=1)
   abs_floor = max(0.1 * float(output_scale), 1e-7)
   pow_floor = abs_floor**2
   wave_per_clip = jnp.mean(
-    jnp.abs(y[:, start:] - x_delayed[:, start:]), axis=1
-  ) / jnp.maximum(jnp.mean(jnp.abs(x_delayed[:, start:]), axis=1), abs_floor)
-  warm_per_clip = jnp.mean(y[:, :start] ** 2, axis=1) / jnp.maximum(
+    jnp.abs(y[:, lookahead:] - x_delayed[:, lookahead:]), axis=1
+  ) / jnp.maximum(
+    jnp.mean(jnp.abs(x_delayed[:, lookahead:]), axis=1), abs_floor
+  )
+  lookahead_energy = (
+    jnp.mean(y[:, :lookahead] ** 2, axis=1)
+    if lookahead > 0
+    else jnp.zeros((y.shape[0],), dtype=jnp.float32)
+  )
+  excess_warm = jnp.mean(
+    jnp.maximum(y[:, :start] ** 2 - x_delayed[:, :start] ** 2, 0.0), axis=1
+  )
+  warm_per_clip = (lookahead_energy + excess_warm) / jnp.maximum(
     jnp.mean(x_delayed[:, start:] ** 2, axis=1), pow_floor
   )
 
   lam_arr = jnp.asarray(lam, dtype=jnp.float32)
   total_per_clip = (
-    nap_per_clip + lam_arr * wave_per_clip + warmup_weight * warm_per_clip
+    nap_total + lam_arr * wave_per_clip + warmup_weight * warm_per_clip
   )
 
   if sai_weight > 0.0:
@@ -422,7 +476,7 @@ def compute_arcfac_inverter_loss(
       lambda a, b: multi_resolution_stft_loss(
         a[None, :], b[None, :], resolutions=stft_resolutions
       )[0]
-    )(y[:, start:], x_delayed[:, start:])
+    )(y[:, lookahead:], x_delayed[:, lookahead:])
     total_per_clip = total_per_clip + stft_w * stft_per_clip
     active_mask = stft_w > 0.0
     stft_mean = jnp.sum(
@@ -434,7 +488,7 @@ def compute_arcfac_inverter_loss(
   loss = jnp.mean(total_per_clip)
   return loss, {
     "loss": cast(jnp.ndarray, loss),
-    "nap_l1": cast(jnp.ndarray, jnp.mean(nap_per_clip)),
+    "nap_l1": cast(jnp.ndarray, jnp.mean(nap_steady)),
     "sai_l1": cast(jnp.ndarray, sai_mean),
     "l1_waveform": cast(jnp.ndarray, jnp.mean(wave_per_clip)),
     "warmup_energy": cast(jnp.ndarray, jnp.mean(warm_per_clip)),
