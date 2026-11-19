@@ -2,6 +2,7 @@
 
 import pathlib
 import tempfile
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -87,26 +88,30 @@ class NeuralRefinerTest(absltest.TestCase):
     ws_n = tgt_n * 0.8
     params = model.init(rng, ws, tgt_n, ws_n)
 
-    out = model.apply(params, ws, tgt_n, ws_n)
+    out = cast(jnp.ndarray, model.apply(params, ws, tgt_n, ws_n))
     self.assertEqual(out.shape, ws.shape)
     self.assertLess(float(jnp.max(jnp.abs(out - ws))), 1e-6)
 
-    zeros_out = model.apply(
-      params,
-      jnp.zeros((1, 2048), dtype=jnp.float32),
-      jnp.zeros((1, 2048, cfg.n_coch_bins), dtype=jnp.float32),
-      jnp.zeros((1, 2048, cfg.n_coch_bins), dtype=jnp.float32),
+    zeros_out = cast(
+      jnp.ndarray,
+      model.apply(
+        params,
+        jnp.zeros((1, 2048), dtype=jnp.float32),
+        jnp.zeros((1, 2048, cfg.n_coch_bins), dtype=jnp.float32),
+        jnp.zeros((1, 2048, cfg.n_coch_bins), dtype=jnp.float32),
+      ),
     )
     self.assertEqual(float(jnp.max(jnp.abs(zeros_out))), 0.0)
 
     # Non-hop-multiple odd length should match shape cleanly.
-    odd_out = model.apply(
-      params, ws[:1, :3993], tgt_n[:1, :3993], ws_n[:1, :3993]
+    odd_out = cast(
+      jnp.ndarray,
+      model.apply(params, ws[:1, :3993], tgt_n[:1, :3993], ws_n[:1, :3993]),
     )
     self.assertEqual(odd_out.shape, (1, 3993))
 
     def _loss(p):
-      pred = model.apply(p, ws, tgt_n, ws_n)
+      pred = cast(jnp.ndarray, model.apply(p, ws, tgt_n, ws_n))
       return jnp.mean((pred - ws) ** 2)
 
     grads = jax.grad(_loss)(params)
@@ -217,6 +222,8 @@ class NeuralRefinerTest(absltest.TestCase):
         model_config=tiny_cfg,
       )
       self.assertTrue(ckpt_p.is_file())
+      self.assertIsNotNone(result.stage1_checkpoint_path)
+      assert result.stage1_checkpoint_path is not None
       self.assertTrue(pathlib.Path(result.stage1_checkpoint_path).is_file())
       self.assertTrue(np.isfinite(result.best_stage1_val_loss))
       self.assertTrue(np.isfinite(result.best_stage2_val_loss))
@@ -260,6 +267,8 @@ class NeuralRefinerTest(absltest.TestCase):
         eval_every=1,
         model_config=tiny_cfg,
       )
+      self.assertIsNotNone(s1_res.stage1_checkpoint_path)
+      assert s1_res.stage1_checkpoint_path is not None
       self.assertTrue(pathlib.Path(s1_res.stage1_checkpoint_path).is_file())
 
       result = train_neural_refiner.run_training(
@@ -300,6 +309,49 @@ class NeuralRefinerTest(absltest.TestCase):
           output_checkpoint=str(ckpt_p),
           objective="invalid",
         )
+
+  def test_refine_waveform_chunked_ola_with_preroll(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      ckpt_p = pathlib.Path(tmp_dir) / "ola.npz"
+      cfg = neural.NeuralRefinerConfig(
+        dim=32, dilations=(1, 2), unet_base_dim=8
+      )
+      model = neural.NapResidualRefiner(cfg)
+      params = model.init(
+        jax.random.PRNGKey(9),
+        jnp.zeros((1, 1024), dtype=jnp.float32),
+        jnp.zeros((1, 1024, cfg.n_coch_bins), dtype=jnp.float32),
+        jnp.zeros((1, 1024, cfg.n_coch_bins), dtype=jnp.float32),
+      )
+      neural.save_refiner_checkpoint(ckpt_p, params, cfg)
+
+      healthy = carfac.build(fs=16000)
+      t = np.arange(4800, dtype=np.float32) / 16000.0
+      ws = (0.015 * np.sin(2.0 * np.pi * 300.0 * t)).astype(np.float32)
+      tgt_nap = np.asarray(healthy(jnp.asarray(ws[:, None]))[:, :, 0])
+
+      out_preroll = neural.refine_waveform(
+        tgt_nap,
+        ws,
+        healthy,
+        ckpt_p,
+        chunk_seconds=0.15,
+        chunk_overlap_s=0.04,
+        chunk_preroll_s=0.128,
+      )
+      out_nopreroll = neural.refine_waveform(
+        tgt_nap,
+        ws,
+        healthy,
+        ckpt_p,
+        chunk_seconds=0.15,
+        chunk_overlap_s=0.04,
+        chunk_preroll_s=0.0,
+      )
+      self.assertEqual(out_preroll.shape, ws.shape)
+      self.assertEqual(out_nopreroll.shape, ws.shape)
+      self.assertTrue(np.all(np.isfinite(out_preroll)))
+      self.assertTrue(np.all(np.isfinite(out_nopreroll)))
 
 
 if __name__ == "__main__":

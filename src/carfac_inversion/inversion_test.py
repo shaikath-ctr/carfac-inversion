@@ -501,6 +501,29 @@ class CarfacInversionTest(parameterized.TestCase):
       0.97,
     )
 
+  def test_non_pytree_cochlea_ola_chunking_and_scan_convergence(self):
+    lin = _SimpleLinearCochlea(sample_rate_hz=16000.0, num_channels=8)
+    sig = _make_speech_like_signal(sample_rate_hz=16000, duration_s=0.35)
+    nap = np.asarray(lin(jnp.asarray(sig[:, None]))[:, :, 0])
+    cfg = inversion.InversionConfig(
+      mode="exact",
+      adam_steps=8,
+      lbfgs_steps=6,
+      chunk_seconds=0.15,
+      chunk_overlap_s=0.05,
+      chunk_preroll_s=0.128,
+    )
+    self.assertEqual(inversion.InversionConfig().chunk_preroll_s, 0.128)
+    res = inversion.invert_nap(nap, lin, cfg)
+    self.assertEqual(res.waveform.shape, sig.shape)
+    self.assertTrue(np.all(np.isfinite(res.waveform)))
+    # Multi-chunk OLA collects step losses across every chunk cleanly.
+    self.assertGreater(len(res.loss_history), cfg.adam_steps + cfg.lbfgs_steps)
+    self.assertGreater(
+      float(np.corrcoef(res.reconstructed_nap.ravel(), nap.ravel())[0, 1]),
+      0.99,
+    )
+
 
 if __name__ == "__main__":
   absltest.main()

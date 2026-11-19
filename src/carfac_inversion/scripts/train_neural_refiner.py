@@ -10,10 +10,16 @@ Runs a two-stage training curriculum on cached ``(target_wav, ws_wav)`` pairs:
 
 import dataclasses
 import functools
+import gc
 import math
 import pathlib
 import time
+from collections.abc import Callable
+from collections.abc import Iterator
+from collections.abc import Mapping
 from collections.abc import Sequence
+from typing import Any
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -28,6 +34,7 @@ from hp_acoustic.models import sai
 
 from carfac_inversion import inversion
 from carfac_inversion import neural
+from carfac_inversion import tpu
 
 FLAGS = flags.FLAGS
 
@@ -52,6 +59,9 @@ _SAI_FFT_LEN: flags.FlagHolder[int]
 _DRIFT_WEIGHT: flags.FlagHolder[float]
 _HF_DIFF_WEIGHT: flags.FlagHolder[float]
 _SEED: flags.FlagHolder[int]
+_STEPS_PER_LOOP: flags.FlagHolder[int]
+_COMPILATION_CACHE_DIR: flags.FlagHolder[str | None]
+_MATMUL_PRECISION: flags.FlagHolder[str]
 
 _MRSTFT_SPECS = (
   (2048, True, 0.25),
@@ -102,6 +112,9 @@ def define_flags(flag_values: flags.FlagValues = FLAGS) -> None:
   global _SAI_FFT_LEN
   global _DRIFT_WEIGHT
   global _HF_DIFF_WEIGHT
+  global _STEPS_PER_LOOP
+  global _COMPILATION_CACHE_DIR
+  global _MATMUL_PRECISION
 
   _TRAIN_CACHE = flags.DEFINE_string(
     "train_cache",
@@ -231,6 +244,27 @@ def define_flags(flag_values: flags.FlagValues = FLAGS) -> None:
     "hf_diff_weight",
     0.0,
     "Optional high-frequency difference regularizer weight in --objective=perceptual.",
+    flag_values=flag_values,
+  )
+  _STEPS_PER_LOOP = flags.DEFINE_integer(
+    "steps_per_loop",
+    1,
+    "Optimizer steps fused per device jax.lax.scan call (K >= 1). Values > 1 "
+    "eliminate host dispatch overhead on TPU.",
+    flag_values=flag_values,
+  )
+  _COMPILATION_CACHE_DIR = flags.DEFINE_string(
+    "compilation_cache_dir",
+    None,
+    "Optional directory or GCS URI for persistent XLA compilation cache.",
+    flag_values=flag_values,
+  )
+  _MATMUL_PRECISION = flags.DEFINE_enum(
+    "matmul_precision",
+    "high",
+    ("default", "high", "highest", "float32"),
+    "JAX default matmul precision policy ('high' preserves TPU accuracy while "
+    "keeping CARFAC cochlea states and losses in float32).",
     flag_values=flag_values,
   )
 
@@ -618,13 +652,166 @@ def _load_perceptual_cache(
   return ws_w, canon_tgt, canon_ws, raw_tgt
 
 
+def _iter_sampled_batches(
+  arrays: tuple[np.ndarray, ...],
+  np_rng: np.random.Generator,
+  batch_size: int,
+  num_batches: int,
+) -> Iterator[tuple[np.ndarray, ...]]:
+  """Yields ``num_batches`` host mini-batches sampled uniformly from ``arrays``."""
+  n_items = len(arrays[0])
+  replace = n_items < batch_size
+  for _ in range(num_batches):
+    idx = np_rng.choice(n_items, size=batch_size, replace=replace)
+    yield tuple(arr[idx] for arr in arrays)
+
+
+def _extract_last_step_metrics(
+  metrics_dev: Mapping[str, jnp.ndarray],
+) -> dict[str, float]:
+  """Copies ``[K]`` device metrics to host once and returns final-step scalars."""
+  return {k: float(np.asarray(v)[-1]) for k, v in metrics_dev.items()}
+
+
+def _validate_batch_size(
+  name: str,
+  batch_size: int,
+  mesh: jax.sharding.Mesh,
+) -> None:
+  """Ensures training mini-batch size divides cleanly across local devices."""
+  n_local = max(1, len(mesh.local_devices))
+  if batch_size < 1 or batch_size % n_local != 0:
+    raise ValueError(
+      f"{name}={batch_size} must be a positive multiple of local device count "
+      f"{n_local}."
+    )
+
+
+def _place_eval_batch(
+  batch_tuple: tuple[np.ndarray, ...],
+  mesh: jax.sharding.Mesh,
+) -> tuple[jnp.ndarray, ...]:
+  """Places an evaluation batch sharded across ``mesh`` (or replicated on tail)."""
+  n_local = max(1, len(mesh.local_devices))
+  if len(batch_tuple[0]) % n_local == 0:
+    return cast(
+      tuple[jnp.ndarray, ...],
+      tpu.shard_batch(batch_tuple, mesh, stacked=False),
+    )
+  return tpu.replicate_tree(tuple(jnp.asarray(x) for x in batch_tuple), mesh)
+
+
+def _run_training_stage(
+  *,
+  params: Mapping[str, Any],
+  opt_state: optax.OptState,
+  mesh: jax.sharding.Mesh,
+  single_step_fn: Callable[
+    [Mapping[str, Any], optax.OptState, Any],
+    tuple[Mapping[str, Any], optax.OptState, dict[str, jnp.ndarray]],
+  ],
+  multi_step_fn: Callable[
+    [Mapping[str, Any], optax.OptState, Any],
+    tuple[Mapping[str, Any], optax.OptState, dict[str, jnp.ndarray]],
+  ],
+  train_arrays: tuple[np.ndarray, ...],
+  np_rng: np.random.Generator,
+  total_steps: int,
+  batch_size: int,
+  steps_per_loop: int,
+  eval_every: int,
+  eval_fn: Callable[[Mapping[str, Any]], dict[str, float]],
+  best_loss_init: float,
+  best_params_host_init: Mapping[str, Any],
+  on_eval: Callable[[int, dict[str, float], dict[str, float]], None],
+  on_best: Callable[[Mapping[str, Any], dict[str, float]], None] | None = None,
+) -> tuple[Mapping[str, Any], optax.OptState, float, Mapping[str, Any]]:
+  """Runs ``total_steps`` using fused ``jax.lax.scan`` loops and DMA prefetching.
+
+  Donated ``params`` and ``opt_state`` buffers remain purely on device between
+  evaluations; whenever validation improves, a detached host NumPy copy of
+  ``params`` is snapshotted so buffer donation never aliases live references.
+  """
+  eval_cadence = max(1, eval_every)
+  eff_k = (
+    min(steps_per_loop, total_steps, eval_cadence) if steps_per_loop > 1 else 1
+  )
+  best_loss = best_loss_init
+  best_params_host = best_params_host_init
+  step = 0
+
+  def _handle_eval(curr_step: int, metrics_dev: dict[str, jnp.ndarray]) -> None:
+    nonlocal best_loss, best_params_host
+    tr_m = _extract_last_step_metrics(metrics_dev)
+    val_m = eval_fn(params)
+    on_eval(curr_step, tr_m, val_m)
+    if math.isfinite(val_m["total"]) and val_m["total"] < best_loss:
+      best_loss = float(val_m["total"])
+      best_params_host = tpu.to_host_tree(params)
+      if on_best is not None:
+        on_best(best_params_host, val_m)
+
+  def _run_chunks(
+    n_chunks: int,
+    chunk_k: int,
+    step_fn: Callable[
+      [Mapping[str, Any], optax.OptState, Any],
+      tuple[Mapping[str, Any], optax.OptState, dict[str, jnp.ndarray]],
+    ],
+    *,
+    force_final_eval: bool,
+  ) -> None:
+    nonlocal params, opt_state, step
+    if n_chunks <= 0:
+      return
+    with tpu.ThreadedDevicePrefetcher(
+      _iter_sampled_batches(
+        train_arrays, np_rng, batch_size, n_chunks * chunk_k
+      ),
+      mesh,
+      steps_per_loop=chunk_k,
+    ) as prefetcher:
+      for chunk_idx, dev_chunk in enumerate(prefetcher, start=1):
+        params, opt_state, m_dev = step_fn(params, opt_state, dev_chunk)
+        step += chunk_k
+        is_eval = (step % eval_cadence == 0) or (
+          force_final_eval and step == total_steps
+        )
+        if is_eval:
+          _handle_eval(step, m_dev)
+        elif chunk_k > 1 and chunk_idx % 4 == 0:
+          jax.tree_util.tree_leaves(m_dev)[0].block_until_ready()
+
+  def _run_segment(n_steps: int, *, eval_at_end: bool) -> None:
+    n_k = (n_steps // eff_k) if eff_k > 1 else 0
+    n_rem = n_steps - n_k * eff_k
+    _run_chunks(
+      n_k, eff_k, multi_step_fn, force_final_eval=(eval_at_end and n_rem == 0)
+    )
+    _run_chunks(n_rem, 1, single_step_fn, force_final_eval=eval_at_end)
+
+  if eff_k == 1 or (eval_cadence % eff_k == 0):
+    _run_segment(total_steps, eval_at_end=True)
+  else:
+    milestones = list(range(eval_cadence, total_steps, eval_cadence))
+    if not milestones or milestones[-1] != total_steps:
+      milestones.append(total_steps)
+    prev = 0
+    for target_step in milestones:
+      _run_segment(target_step - prev, eval_at_end=(target_step == total_steps))
+      prev = target_step
+
+  return params, opt_state, best_loss, best_params_host
+
+
 def _evaluate_perceptual_split(
-  eval_batch_fn,
+  eval_batch_fn: Callable[..., dict[str, jnp.ndarray]],
+  mesh: jax.sharding.Mesh,
   ws_wavs: np.ndarray,
   canon_tgt_naps: np.ndarray,
   canon_ws_naps: np.ndarray,
   raw_tgt_naps: np.ndarray,
-  params: dict,
+  params: Mapping[str, Any],
   *,
   batch_size: int = 4,
 ) -> dict[str, float]:
@@ -643,16 +830,20 @@ def _evaluate_perceptual_split(
       )
     else:
       pad_idx = np.arange(s, e)
-    metrics = eval_batch_fn(
-      params,
-      jnp.asarray(ws_wavs[pad_idx]),
-      jnp.asarray(canon_tgt_naps[pad_idx]),
-      jnp.asarray(canon_ws_naps[pad_idx]),
-      jnp.asarray(raw_tgt_naps[pad_idx]),
-      jnp.asarray(weights),
+    b_ws, b_tc, b_wc, b_rtgt, b_w = tpu.shard_batch(
+      (
+        ws_wavs[pad_idx],
+        canon_tgt_naps[pad_idx],
+        canon_ws_naps[pad_idx],
+        raw_tgt_naps[pad_idx],
+        weights,
+      ),
+      mesh,
+      stacked=False,
     )
+    metrics = eval_batch_fn(params, b_ws, b_tc, b_wc, b_rtgt, b_w)
     for k, v in metrics.items():
-      sums[k] = sums.get(k, 0.0) + float(v) * cnt
+      sums[k] = sums.get(k, 0.0) + float(np.asarray(v)) * cnt
     total_weight += cnt
   return {k: v / max(1.0, total_weight) for k, v in sums.items()}
 
@@ -673,10 +864,22 @@ def _run_perceptual_training(
   hf_diff_weight: float,
   seed: int,
   model_config: neural.NeuralRefinerConfig | None,
+  steps_per_loop: int = 1,
+  compilation_cache_dir: str | None = None,
+  matmul_precision: str = "high",
 ) -> TrainingResult:
   """Trains a Phase 3b refiner end-to-end under differentiable CARFAC perceptual loss."""
+  if steps_per_loop < 1:
+    raise ValueError(f"steps_per_loop must be >= 1, got {steps_per_loop}.")
   t0 = time.perf_counter()
-  init_params = None
+  backend, n_devices = tpu.configure_runtime(
+    compilation_cache_dir=compilation_cache_dir,
+    matmul_precision=matmul_precision,
+  )
+  mesh = tpu.make_data_mesh()
+  _validate_batch_size("perceptual_batch_size", batch_size, mesh)
+
+  init_params: Mapping[str, Any] | None = None
   if init_checkpoint is not None:
     _, init_params, init_cfg = neural.load_refiner_checkpoint(init_checkpoint)
     if model_config is not None:
@@ -717,16 +920,23 @@ def _run_perceptual_training(
     dtype=np.float32,
   )
   proj_w = neural.cochlea_cf_projection(cochlea_model, cfg)
-  rest_nap_j = jnp.asarray(rest_nap, dtype=jnp.float32)
+  rest_nap_j = tpu.replicate_tree(
+    jnp.asarray(rest_nap, dtype=jnp.float32), mesh
+  )
+  rep_cochlea = tpu.replicate_tree(
+    jax.tree_util.tree_map(jax.lax.stop_gradient, cochlea_model), mesh
+  )
 
   print(
-    f"Loading Phase 3b perceptual caches ({fs} Hz, T={t_len})...", flush=True
+    f"Loading Phase 3b perceptual caches ({fs} Hz, T={t_len}, "
+    f"backend={backend}, devices={n_devices}, K={steps_per_loop})...",
+    flush=True,
   )
   tr_ws, tr_tgt_c, tr_ws_c, tr_raw_tgt = _load_perceptual_cache(
-    train_cache, cochlea_model, proj_w, rest_nap
+    train_cache, rep_cochlea, proj_w, rest_nap
   )
   va_ws, va_tgt_c, va_ws_c, va_raw_tgt = _load_perceptual_cache(
-    val_cache, cochlea_model, proj_w, rest_nap
+    val_cache, rep_cochlea, proj_w, rest_nap
   )
   n_train = len(tr_ws)
   print(
@@ -736,14 +946,17 @@ def _run_perceptual_training(
   )
 
   if init_params is None:
-    params = model.init(
+    raw_params = model.init(
       jax.random.PRNGKey(seed),
       jnp.zeros((1, t_len), dtype=jnp.float32),
       jnp.zeros((1, t_len, cfg.n_coch_bins), dtype=jnp.float32),
       jnp.zeros((1, t_len, cfg.n_coch_bins), dtype=jnp.float32),
     )
+    init_host = tpu.to_host_tree(raw_params)
+    tpu.delete_tree(raw_params)
+    params = cast(Mapping[str, Any], tpu.replicate_tree(init_host, mesh))
   else:
-    params = init_params
+    params = cast(Mapping[str, Any], tpu.replicate_tree(init_params, mesh))
 
   warmup = min(50, max(1, steps // 10))
   schedule = optax.warmup_cosine_decay_schedule(
@@ -757,53 +970,78 @@ def _run_perceptual_training(
     optax.clip_by_global_norm(2.0),
     optax.adamw(learning_rate=schedule, weight_decay=1e-4),
   )
-  opt_state = tx.init(params)
+  opt_state = tpu.replicate_tree(tx.init(params), mesh)
 
-  loss_kwargs = dict(
-    cochlea_model=cochlea_model,
-    rest_nap_raw=rest_nap_j,
-    sample_rate_hz=fs,
-    perceptual_nap_weight=perceptual_nap_weight,
-    sai_fft_len=sai_fft_len,
-    drift_weight=drift_weight,
-    hf_diff_weight=hf_diff_weight,
+  def _loss_on_batch(
+    pr: Mapping[str, Any],
+    b_ws: jnp.ndarray,
+    b_tc: jnp.ndarray,
+    b_wc: jnp.ndarray,
+    b_rtgt: jnp.ndarray,
+    sample_weights: jnp.ndarray | None = None,
+  ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
+    pred = cast(jnp.ndarray, model.apply(pr, b_ws, b_tc, b_wc))
+    return compute_perceptual_refiner_losses(
+      pred,
+      b_rtgt,
+      cochlea_model=rep_cochlea,
+      rest_nap_raw=rest_nap_j,
+      sample_rate_hz=fs,
+      perceptual_nap_weight=perceptual_nap_weight,
+      sai_fft_len=sai_fft_len,
+      drift_weight=drift_weight,
+      hf_diff_weight=hf_diff_weight,
+      sample_weights=sample_weights,
+    )
+
+  def step_impl(
+    p: Mapping[str, Any],
+    os_state: optax.OptState,
+    batch: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
+  ) -> tuple[Mapping[str, Any], optax.OptState, dict[str, jnp.ndarray]]:
+    b_ws, b_tc, b_wc, b_rtgt = batch
+    (_, metrics), grads = jax.value_and_grad(_loss_on_batch, has_aux=True)(
+      p, b_ws, b_tc, b_wc, b_rtgt
+    )
+    updates, new_os = tx.update(grads, os_state, p)
+    next_p = cast(Mapping[str, Any], optax.apply_updates(p, updates))
+    return next_p, new_os, metrics
+
+  single_step_fn, multi_step_fn = tpu.make_multi_step_fns(
+    step_impl, donate_argnums=(0, 1)
   )
 
   @jax.jit
-  def train_step(p, os, b_ws, b_tc, b_wc, b_rtgt):
-    def _loss_fn(pr):
-      pred = model.apply(pr, b_ws, b_tc, b_wc)
-      return compute_perceptual_refiner_losses(pred, b_rtgt, **loss_kwargs)
-
-    (val, metrics), grads = jax.value_and_grad(_loss_fn, has_aux=True)(p)
-    updates, new_os = tx.update(grads, os, p)
-    return optax.apply_updates(p, updates), new_os, val, metrics
-
-  @jax.jit
-  def eval_batch(p, b_ws, b_tc, b_wc, b_rtgt, b_weights):
-    pred = model.apply(p, b_ws, b_tc, b_wc)
-    _, metrics = compute_perceptual_refiner_losses(
-      pred, b_rtgt, sample_weights=b_weights, **loss_kwargs
-    )
+  def eval_batch(
+    p: Mapping[str, Any],
+    b_ws: jnp.ndarray,
+    b_tc: jnp.ndarray,
+    b_wc: jnp.ndarray,
+    b_rtgt: jnp.ndarray,
+    b_weights: jnp.ndarray,
+  ) -> dict[str, jnp.ndarray]:
+    _, metrics = _loss_on_batch(p, b_ws, b_tc, b_wc, b_rtgt, b_weights)
     return metrics
 
-  rng = np.random.default_rng(seed)
-  best_val_loss = float("inf")
+  def _eval_val(p: Mapping[str, Any]) -> dict[str, float]:
+    return _evaluate_perceptual_split(
+      eval_batch,
+      mesh,
+      va_ws,
+      va_tgt_c,
+      va_ws_c,
+      va_raw_tgt,
+      p,
+      batch_size=batch_size,
+    )
+
+  np_rng = np.random.default_rng(seed)
   best_val_nap_corr = -1.0
-  init_val_loss = 0.0
   history: list[dict[str, float]] = []
   out_path = pathlib.Path(output_checkpoint)
 
   # Log step-0 baseline before any update, without overwriting best with unadapted exact weights.
-  val0 = _evaluate_perceptual_split(
-    eval_batch,
-    va_ws,
-    va_tgt_c,
-    va_ws_c,
-    va_raw_tgt,
-    params,
-    batch_size=batch_size,
-  )
+  val0 = _eval_val(params)
   init_val_loss = float(val0["total"])
   print(
     f"[Phase3b] init val loss={val0['total']:.4f} "
@@ -811,8 +1049,10 @@ def _run_perceptual_training(
     f"nap={val0['nap']:.4f}, nap_corr={val0['nap_corr']:.4f}, drift={val0['drift']:.4f})",
     flush=True,
   )
+  best_host = tpu.to_host_tree(params)
   if steps == 0:
-    neural.save_refiner_checkpoint(out_path, params, cfg)
+    neural.save_refiner_checkpoint(out_path, best_host, cfg)
+    tpu.delete_tree((params, opt_state))
     return TrainingResult(
       best_stage1_val_loss=init_val_loss,
       best_stage2_val_loss=init_val_loss,
@@ -824,31 +1064,22 @@ def _run_perceptual_training(
       best_val_nap_corr=float(val0["nap_corr"]),
     )
 
-  for step in range(1, steps + 1):
-    idx = rng.integers(0, n_train, size=batch_size)
-    params, opt_state, loss_val, m_tr = train_step(
-      params,
-      opt_state,
-      jnp.asarray(tr_ws[idx]),
-      jnp.asarray(tr_tgt_c[idx]),
-      jnp.asarray(tr_ws_c[idx]),
-      jnp.asarray(tr_raw_tgt[idx]),
-    )
-    if step % max(1, eval_every) == 0 or step == steps:
-      m_val = _evaluate_perceptual_split(
-        eval_batch,
-        va_ws,
-        va_tgt_c,
-        va_ws_c,
-        va_raw_tgt,
-        params,
-        batch_size=batch_size,
-      )
-      rec = {
+  best_val_loss = float("inf")
+
+  logged_best = float("inf")
+
+  def _on_eval_and_log(
+    step_idx: int,
+    tr_m: dict[str, float],
+    m_val: dict[str, float],
+  ) -> None:
+    nonlocal logged_best
+    history.append(
+      {
         "stage": 3.0,
-        "step": float(step),
-        "train_loss": float(loss_val),
-        "train_nap_corr": float(m_tr["nap_corr"]),
+        "step": float(step_idx),
+        "train_loss": float(tr_m["total"]),
+        "train_nap_corr": float(tr_m["nap_corr"]),
         "val_loss": float(m_val["total"]),
         "val_perc": float(m_val["perc"]),
         "val_env": float(m_val["env"]),
@@ -857,18 +1088,44 @@ def _run_perceptual_training(
         "val_drift": float(m_val["drift"]),
         "val_nap_corr": float(m_val["nap_corr"]),
       }
-      history.append(rec)
-      if m_val["total"] < best_val_loss:
-        best_val_loss = float(m_val["total"])
-        best_val_nap_corr = float(m_val["nap_corr"])
-        neural.save_refiner_checkpoint(out_path, params, cfg)
-      print(
-        f"[Phase3b] step {step:4d}/{steps} | train={float(loss_val):.4f} "
-        f"| val={m_val['total']:.4f} (env={m_val['env']:.4f}, sai={m_val['sai']:.4f}, "
-        f"nap={m_val['nap']:.4f}, drift={m_val['drift']:.4f}, nap_corr={m_val['nap_corr']:.4f}) "
-        f"| best={best_val_loss:.4f} | t={time.perf_counter() - t0:.1f}s",
-        flush=True,
-      )
+    )
+    if math.isfinite(m_val["total"]) and m_val["total"] < logged_best:
+      logged_best = float(m_val["total"])
+    print(
+      f"[Phase3b] step {step_idx:4d}/{steps} | train={tr_m['total']:.4f} "
+      f"| val={m_val['total']:.4f} (env={m_val['env']:.4f}, sai={m_val['sai']:.4f}, "
+      f"nap={m_val['nap']:.4f}, drift={m_val['drift']:.4f}, nap_corr={m_val['nap_corr']:.4f}) "
+      f"| best={logged_best:.4f} | t={time.perf_counter() - t0:.1f}s",
+      flush=True,
+    )
+
+  def _on_best(
+    best_p_host: Mapping[str, Any],
+    m_val: dict[str, float],
+  ) -> None:
+    nonlocal best_val_nap_corr
+    best_val_nap_corr = float(m_val["nap_corr"])
+    neural.save_refiner_checkpoint(out_path, best_p_host, cfg)
+
+  params, opt_state, best_val_loss, _ = _run_training_stage(
+    params=params,
+    opt_state=opt_state,
+    mesh=mesh,
+    single_step_fn=single_step_fn,
+    multi_step_fn=multi_step_fn,
+    train_arrays=(tr_ws, tr_tgt_c, tr_ws_c, tr_raw_tgt),
+    np_rng=np_rng,
+    total_steps=steps,
+    batch_size=batch_size,
+    steps_per_loop=steps_per_loop,
+    eval_every=eval_every,
+    eval_fn=_eval_val,
+    best_loss_init=best_val_loss,
+    best_params_host_init=best_host,
+    on_eval=_on_eval_and_log,
+    on_best=_on_best,
+  )
+  tpu.delete_tree((params, opt_state))
 
   return TrainingResult(
     best_stage1_val_loss=init_val_loss,
@@ -933,13 +1190,14 @@ def _precompute_cochlear_features(
 
 
 def _evaluate_split(
-  eval_batch_fn,
+  eval_batch_fn: Callable[..., dict[str, jnp.ndarray]],
+  mesh: jax.sharding.Mesh,
   ws_wavs: np.ndarray,
   tgt_wavs: np.ndarray,
   canon_tgt_naps: np.ndarray,
   canon_ws_naps: np.ndarray,
   raw_tgt_naps: np.ndarray,
-  params: dict,
+  params: Mapping[str, Any],
   *,
   batch_size: int = 8,
 ) -> dict[str, float]:
@@ -950,21 +1208,19 @@ def _evaluate_split(
   for start in range(0, n_ex, batch_size):
     end = min(n_ex, start + batch_size)
     k = end - start
-    ws_b = ws_wavs[start:end]
-    tgt_b = tgt_wavs[start:end]
-    tc_b = canon_tgt_naps[start:end]
-    wc_b = canon_ws_naps[start:end]
-    tr_b = raw_tgt_naps[start:end]
-    metrics = eval_batch_fn(
-      params,
-      jnp.asarray(ws_b),
-      jnp.asarray(tc_b),
-      jnp.asarray(wc_b),
-      jnp.asarray(tgt_b),
-      jnp.asarray(tr_b),
+    ws_b, tc_b, wc_b, tgt_b, tr_b = _place_eval_batch(
+      (
+        ws_wavs[start:end],
+        canon_tgt_naps[start:end],
+        canon_ws_naps[start:end],
+        tgt_wavs[start:end],
+        raw_tgt_naps[start:end],
+      ),
+      mesh,
     )
+    metrics = eval_batch_fn(params, ws_b, tc_b, wc_b, tgt_b, tr_b)
     for key, val in metrics.items():
-      sums[key] = sums.get(key, 0.0) + float(val) * k
+      sums[key] = sums.get(key, 0.0) + float(np.asarray(val)) * k
     total_count += k
   return {k: v / max(total_count, 1) for k, v in sums.items()}
 
@@ -993,6 +1249,9 @@ def run_training(
   sai_fft_len: int = 2048,
   drift_weight: float = 0.5,
   hf_diff_weight: float = 0.0,
+  steps_per_loop: int = 1,
+  compilation_cache_dir: str | None = None,
+  matmul_precision: str = "high",
 ) -> TrainingResult:
   """Trains a Phase 3 (`exact`) or Phase 3b (`perceptual`) residual refiner."""
   if objective == "perceptual":
@@ -1011,12 +1270,28 @@ def run_training(
       hf_diff_weight=hf_diff_weight,
       seed=seed,
       model_config=model_config,
+      steps_per_loop=steps_per_loop,
+      compilation_cache_dir=compilation_cache_dir,
+      matmul_precision=matmul_precision,
     )
   if objective != "exact":
     raise ValueError(
       f"Unsupported objective {objective!r}; expected 'exact' or 'perceptual'."
     )
+  if steps_per_loop < 1:
+    raise ValueError(f"steps_per_loop must be >= 1, got {steps_per_loop}.")
+
   t0 = time.perf_counter()
+  backend, n_devices = tpu.configure_runtime(
+    compilation_cache_dir=compilation_cache_dir,
+    matmul_precision=matmul_precision,
+  )
+  mesh = tpu.make_data_mesh()
+  if stage1_steps > 0:
+    _validate_batch_size("batch_size", batch_size, mesh)
+  if stage2_steps > 0:
+    _validate_batch_size("stage2_batch_size", stage2_batch_size, mesh)
+
   cfg = neural.NeuralRefinerConfig() if model_config is None else model_config
   model = neural.NapResidualRefiner(config=cfg)
   fs = int(round(cfg.sample_rate_hz))
@@ -1038,12 +1313,19 @@ def run_training(
   )
   proj_w = neural.cochlea_cf_projection(cochlea_model, cfg)
   cfs = np.asarray(cochlea_model.channel_frequencies, dtype=np.float32)
-  hf_chan_mask = jnp.asarray((cfs >= 3500.0).astype(np.float32))
-  rest_nap_j = jnp.asarray(rest_nap, dtype=jnp.float32)
-  fixed_cochlea = jax.tree_util.tree_map(jax.lax.stop_gradient, cochlea_model)
+  hf_chan_mask = tpu.replicate_tree(
+    jnp.asarray((cfs >= 3500.0).astype(np.float32)), mesh
+  )
+  rest_nap_j = tpu.replicate_tree(
+    jnp.asarray(rest_nap, dtype=jnp.float32), mesh
+  )
+  fixed_cochlea = tpu.replicate_tree(
+    jax.tree_util.tree_map(jax.lax.stop_gradient, cochlea_model), mesh
+  )
 
   print(
-    f"Precomputing cochlear features ({n_train} train, {len(va_tgt_w)} val)..."
+    f"Precomputing cochlear features ({n_train} train, {len(va_tgt_w)} val, "
+    f"backend={backend}, devices={n_devices}, K={steps_per_loop})..."
   )
   if tr_has_naps:
     _, tr_can_tgt, tr_can_ws, tr_raw_nap = _load_perceptual_cache(
@@ -1065,18 +1347,20 @@ def run_training(
 
   rng = jax.random.PRNGKey(seed)
   np_rng = np.random.default_rng(seed)
-  params = model.init(
+  raw_params = model.init(
     rng,
-    jnp.asarray(tr_ws_w[:batch_size]),
-    jnp.asarray(tr_can_tgt[:batch_size]),
-    jnp.asarray(tr_can_ws[:batch_size]),
+    jnp.zeros((1, t_len), dtype=jnp.float32),
+    jnp.zeros((1, t_len, cfg.n_coch_bins), dtype=jnp.float32),
+    jnp.zeros((1, t_len, cfg.n_coch_bins), dtype=jnp.float32),
   )
+  init_params_host = tpu.to_host_tree(raw_params)
+  tpu.delete_tree(raw_params)
+  params = cast(Mapping[str, Any], tpu.replicate_tree(init_params_host, mesh))
   n_params = sum(p.size for p in jax.tree_util.tree_leaves(params))
   print(f"Initialized NapResidualRefiner with {n_params:,} parameters")
 
-  @functools.partial(jax.jit, static_argnames=("use_carfac",))
-  def eval_step(
-    p: dict,
+  def _eval_and_loss(
+    p: Mapping[str, Any],
     ws_b: jnp.ndarray,
     tc_b: jnp.ndarray,
     wc_b: jnp.ndarray,
@@ -1084,9 +1368,9 @@ def run_training(
     tr_b: jnp.ndarray,
     *,
     use_carfac: bool,
-  ) -> dict[str, jnp.ndarray]:
-    pred = model.apply(p, ws_b, tc_b, wc_b)
-    _, metrics = compute_refiner_losses(
+  ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
+    pred = cast(jnp.ndarray, model.apply(p, ws_b, tc_b, wc_b))
+    return compute_refiner_losses(
       pred,
       tgt_b,
       sample_rate_hz=fs,
@@ -1096,51 +1380,53 @@ def run_training(
       hf_chan_mask=hf_chan_mask if use_carfac else None,
       carfac_weight=carfac_weight if use_carfac else 0.0,
     )
+
+  @functools.partial(jax.jit, static_argnames=("use_carfac",))
+  def eval_step(
+    p: Mapping[str, Any],
+    ws_b: jnp.ndarray,
+    tc_b: jnp.ndarray,
+    wc_b: jnp.ndarray,
+    tgt_b: jnp.ndarray,
+    tr_b: jnp.ndarray,
+    *,
+    use_carfac: bool,
+  ) -> dict[str, jnp.ndarray]:
+    _, metrics = _eval_and_loss(
+      p, ws_b, tc_b, wc_b, tgt_b, tr_b, use_carfac=use_carfac
+    )
     return metrics
 
-  def make_train_step(tx: optax.GradientTransformation, *, use_carfac: bool):
-    @jax.jit
-    def step_fn(
-      p: dict,
+  def make_train_fns(tx: optax.GradientTransformation, *, use_carfac: bool):
+    def step_impl(
+      p: Mapping[str, Any],
       opt_state: optax.OptState,
-      ws_b: jnp.ndarray,
-      tc_b: jnp.ndarray,
-      wc_b: jnp.ndarray,
-      tgt_b: jnp.ndarray,
-      tr_b: jnp.ndarray,
-    ) -> tuple[dict, optax.OptState, dict[str, jnp.ndarray]]:
-      def loss_fn(curr_p: dict) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
-        pred = model.apply(curr_p, ws_b, tc_b, wc_b)
-        return compute_refiner_losses(
-          pred,
-          tgt_b,
-          sample_rate_hz=fs,
-          cochlea_model=fixed_cochlea if use_carfac else None,
-          target_nap_raw=tr_b if use_carfac else None,
-          rest_nap_raw=rest_nap_j if use_carfac else None,
-          hf_chan_mask=hf_chan_mask if use_carfac else None,
-          carfac_weight=carfac_weight if use_carfac else 0.0,
-        )
-
-      (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(p)
+      batch: tuple[
+        jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray
+      ],
+    ) -> tuple[Mapping[str, Any], optax.OptState, dict[str, jnp.ndarray]]:
+      ws_b, tc_b, wc_b, tgt_b, tr_b = batch
+      (_, metrics), grads = jax.value_and_grad(
+        functools.partial(_eval_and_loss, use_carfac=use_carfac),
+        has_aux=True,
+      )(p, ws_b, tc_b, wc_b, tgt_b, tr_b)
       updates, next_opt = tx.update(grads, opt_state, p)
-      return optax.apply_updates(p, updates), next_opt, metrics
+      next_p = cast(Mapping[str, Any], optax.apply_updates(p, updates))
+      return next_p, next_opt, metrics
 
-    return step_fn
-
-  def sample_idx(n_items: int, bsz: int) -> np.ndarray:
-    replace = n_items < bsz
-    return np_rng.choice(n_items, size=bsz, replace=replace)
+    return tpu.make_multi_step_fns(step_impl, donate_argnums=(0, 1))
 
   out_path = pathlib.Path(output_checkpoint)
   stage1_path = out_path.with_name(f"{out_path.stem}_stage1.npz")
   history: list[dict[str, float]] = []
+  train_arrays = (tr_ws_w, tr_can_tgt, tr_can_ws, tr_tgt_w, tr_raw_nap)
 
   # Baseline val evaluation (step 0: should match warm start cleanly).
   val_b = min(batch_size, len(va_tgt_w))
   eval_s1_fn = functools.partial(eval_step, use_carfac=False)
   init_val = _evaluate_split(
     eval_s1_fn,
+    mesh,
     va_ws_w,
     va_tgt_w,
     va_can_tgt,
@@ -1156,7 +1442,7 @@ def run_training(
   )
   best_s1_loss = float(init_val["total"])
   best_s1_sisdr = float(init_val["sisdr_db"])
-  best_s1_params = params
+  best_s1_params_host = init_params_host
 
   if stage1_steps > 0:
     sched1 = optax.warmup_cosine_decay_schedule(
@@ -1170,61 +1456,84 @@ def run_training(
       optax.clip_by_global_norm(2.0),
       optax.adamw(learning_rate=sched1, weight_decay=3e-4),
     )
-    opt_state1 = tx1.init(params)
-    step1_fn = make_train_step(tx1, use_carfac=False)
+    opt_state1 = tpu.replicate_tree(tx1.init(params), mesh)
+    s1_single, s1_multi = make_train_fns(tx1, use_carfac=False)
     t_s1 = time.perf_counter()
 
-    for step in range(1, stage1_steps + 1):
-      idx = sample_idx(n_train, batch_size)
-      params, opt_state1, tr_m = step1_fn(
-        params,
-        opt_state1,
-        jnp.asarray(tr_ws_w[idx]),
-        jnp.asarray(tr_can_tgt[idx]),
-        jnp.asarray(tr_can_ws[idx]),
-        jnp.asarray(tr_tgt_w[idx]),
-        jnp.asarray(tr_raw_nap[idx]),
+    def _s1_eval(p: Mapping[str, Any]) -> dict[str, float]:
+      return _evaluate_split(
+        eval_s1_fn,
+        mesh,
+        va_ws_w,
+        va_tgt_w,
+        va_can_tgt,
+        va_can_ws,
+        va_raw_nap,
+        p,
+        batch_size=val_b,
       )
-      if step % eval_every == 0 or step == stage1_steps:
-        val_m = _evaluate_split(
-          eval_s1_fn,
-          va_ws_w,
-          va_tgt_w,
-          va_can_tgt,
-          va_can_ws,
-          va_raw_nap,
-          params,
-          batch_size=val_b,
-        )
-        elapsed = time.perf_counter() - t_s1
-        print(
-          f"[S1 {step:4d}/{stage1_steps} | {elapsed:5.1f}s] "
-          f"tr={float(tr_m['total']):.4f} (sdr={float(tr_m['sisdr_db']):.2f}) | "
-          f"va={val_m['total']:.4f} sdr={val_m['sisdr_db']:.2f}dB "
-          f"stft={val_m['stft']:.4f} hf={val_m['hf_spec']:.4f} "
-          f"lrms={val_m['log_rms']:.4f}"
-        )
-        history.append({"stage": 1.0, "step": float(step), **val_m})
-        if math.isfinite(val_m["total"]) and val_m["total"] < best_s1_loss:
-          best_s1_loss = float(val_m["total"])
-          best_s1_sisdr = float(val_m["sisdr_db"])
-          best_s1_params = params
 
-    neural.save_refiner_checkpoint(stage1_path, best_s1_params, cfg)
+    def _s1_on_eval(
+      step_idx: int,
+      tr_m: dict[str, float],
+      val_m: dict[str, float],
+    ) -> None:
+      elapsed = time.perf_counter() - t_s1
+      print(
+        f"[S1 {step_idx:4d}/{stage1_steps} | {elapsed:5.1f}s] "
+        f"tr={tr_m['total']:.4f} (sdr={tr_m['sisdr_db']:.2f}) | "
+        f"va={val_m['total']:.4f} sdr={val_m['sisdr_db']:.2f}dB "
+        f"stft={val_m['stft']:.4f} hf={val_m['hf_spec']:.4f} "
+        f"lrms={val_m['log_rms']:.4f}"
+      )
+      history.append({"stage": 1.0, "step": float(step_idx), **val_m})
+
+    def _s1_on_best(
+      _best_p: Mapping[str, Any],
+      val_m: dict[str, float],
+    ) -> None:
+      nonlocal best_s1_sisdr
+      best_s1_sisdr = float(val_m["sisdr_db"])
+
+    params, opt_state1, best_s1_loss, best_s1_params_host = _run_training_stage(
+      params=params,
+      opt_state=opt_state1,
+      mesh=mesh,
+      single_step_fn=s1_single,
+      multi_step_fn=s1_multi,
+      train_arrays=train_arrays,
+      np_rng=np_rng,
+      total_steps=stage1_steps,
+      batch_size=batch_size,
+      steps_per_loop=steps_per_loop,
+      eval_every=eval_every,
+      eval_fn=_s1_eval,
+      best_loss_init=best_s1_loss,
+      best_params_host_init=best_s1_params_host,
+      on_eval=_s1_on_eval,
+      on_best=_s1_on_best,
+    )
+
+    neural.save_refiner_checkpoint(stage1_path, best_s1_params_host, cfg)
     print(
       f"Saved Stage 1 best checkpoint -> {stage1_path} (val={best_s1_loss:.4f})"
     )
-    params = best_s1_params
+    tpu.delete_tree((params, opt_state1))
+    gc.collect()
+    params = cast(
+      Mapping[str, Any], tpu.replicate_tree(best_s1_params_host, mesh)
+    )
 
   best_s2_loss = best_s1_loss
   best_s2_sisdr = best_s1_sisdr
-  best_s2_params = params
+  best_s2_params_host = best_s1_params_host
 
   if stage2_steps > 0:
     eval_s2_fn = functools.partial(eval_step, use_carfac=True)
     s2_b = min(stage2_batch_size, len(va_tgt_w))
     s2_init_val = _evaluate_split(
       eval_s2_fn,
+      mesh,
       va_ws_w,
       va_tgt_w,
       va_can_tgt,
@@ -1249,48 +1558,68 @@ def run_training(
       optax.clip_by_global_norm(2.0),
       optax.adamw(learning_rate=sched2, weight_decay=3e-4),
     )
-    opt_state2 = tx2.init(params)
-    step2_fn = make_train_step(tx2, use_carfac=True)
+    opt_state2 = tpu.replicate_tree(tx2.init(params), mesh)
+    s2_single, s2_multi = make_train_fns(tx2, use_carfac=True)
     t_s2 = time.perf_counter()
     s2_eval_cadence = max(50, min(eval_every, max(50, stage2_steps // 4)))
 
-    for step in range(1, stage2_steps + 1):
-      idx = sample_idx(n_train, stage2_batch_size)
-      params, opt_state2, tr_m = step2_fn(
-        params,
-        opt_state2,
-        jnp.asarray(tr_ws_w[idx]),
-        jnp.asarray(tr_can_tgt[idx]),
-        jnp.asarray(tr_can_ws[idx]),
-        jnp.asarray(tr_tgt_w[idx]),
-        jnp.asarray(tr_raw_nap[idx]),
+    def _s2_eval(p: Mapping[str, Any]) -> dict[str, float]:
+      return _evaluate_split(
+        eval_s2_fn,
+        mesh,
+        va_ws_w,
+        va_tgt_w,
+        va_can_tgt,
+        va_can_ws,
+        va_raw_nap,
+        p,
+        batch_size=s2_b,
       )
-      if step % s2_eval_cadence == 0 or step == stage2_steps:
-        val_m = _evaluate_split(
-          eval_s2_fn,
-          va_ws_w,
-          va_tgt_w,
-          va_can_tgt,
-          va_can_ws,
-          va_raw_nap,
-          params,
-          batch_size=s2_b,
-        )
-        elapsed = time.perf_counter() - t_s2
-        print(
-          f"[S2 {step:4d}/{stage2_steps} | {elapsed:5.1f}s] "
-          f"tr={float(tr_m['total']):.4f} nap={float(tr_m['carfac_nap']):.4f} | "
-          f"va={val_m['total']:.4f} sdr={val_m['sisdr_db']:.2f}dB "
-          f"nap={val_m['carfac_nap']:.4f} hf={val_m['hf_spec']:.4f} "
-          f"lrms={val_m['log_rms']:.4f}"
-        )
-        history.append({"stage": 2.0, "step": float(step), **val_m})
-        if math.isfinite(val_m["total"]) and val_m["total"] < best_s2_loss:
-          best_s2_loss = float(val_m["total"])
-          best_s2_sisdr = float(val_m["sisdr_db"])
-          best_s2_params = params
 
-  neural.save_refiner_checkpoint(out_path, best_s2_params, cfg)
+    def _s2_on_eval(
+      step_idx: int,
+      tr_m: dict[str, float],
+      val_m: dict[str, float],
+    ) -> None:
+      elapsed = time.perf_counter() - t_s2
+      print(
+        f"[S2 {step_idx:4d}/{stage2_steps} | {elapsed:5.1f}s] "
+        f"tr={tr_m['total']:.4f} nap={tr_m['carfac_nap']:.4f} | "
+        f"va={val_m['total']:.4f} sdr={val_m['sisdr_db']:.2f}dB "
+        f"nap={val_m['carfac_nap']:.4f} hf={val_m['hf_spec']:.4f} "
+        f"lrms={val_m['log_rms']:.4f}"
+      )
+      history.append({"stage": 2.0, "step": float(step_idx), **val_m})
+
+    def _s2_on_best(
+      _best_p: Mapping[str, Any],
+      val_m: dict[str, float],
+    ) -> None:
+      nonlocal best_s2_sisdr
+      best_s2_sisdr = float(val_m["sisdr_db"])
+
+    params, opt_state2, best_s2_loss, best_s2_params_host = _run_training_stage(
+      params=params,
+      opt_state=opt_state2,
+      mesh=mesh,
+      single_step_fn=s2_single,
+      multi_step_fn=s2_multi,
+      train_arrays=train_arrays,
+      np_rng=np_rng,
+      total_steps=stage2_steps,
+      batch_size=stage2_batch_size,
+      steps_per_loop=steps_per_loop,
+      eval_every=s2_eval_cadence,
+      eval_fn=_s2_eval,
+      best_loss_init=best_s2_loss,
+      best_params_host_init=best_s2_params_host,
+      on_eval=_s2_on_eval,
+      on_best=_s2_on_best,
+    )
+    tpu.delete_tree(opt_state2)
+
+  tpu.delete_tree(params)
+  neural.save_refiner_checkpoint(out_path, best_s2_params_host, cfg)
   print(
     f"Saved final checkpoint -> {out_path} ({out_path.stat().st_size / 1e6:.2f} MB)"
   )
@@ -1308,10 +1637,17 @@ def run_training(
 def main(argv: Sequence[str]) -> None:
   """Entrypoint for the neural refiner training CLI."""
   del argv
+  train_cache = _TRAIN_CACHE.value
+  val_cache = _VAL_CACHE.value
+  output_checkpoint = _OUTPUT_CHECKPOINT.value
+  if train_cache is None or val_cache is None or output_checkpoint is None:
+    raise ValueError(
+      "--train_cache, --val_cache, and --output_checkpoint must all be provided."
+    )
   run_training(
-    train_cache=_TRAIN_CACHE.value,
-    val_cache=_VAL_CACHE.value,
-    output_checkpoint=_OUTPUT_CHECKPOINT.value,
+    train_cache=train_cache,
+    val_cache=val_cache,
+    output_checkpoint=output_checkpoint,
     stage1_steps=_STAGE1_STEPS.value,
     stage2_steps=_STAGE2_STEPS.value,
     batch_size=_BATCH_SIZE.value,
@@ -1330,6 +1666,9 @@ def main(argv: Sequence[str]) -> None:
     sai_fft_len=_SAI_FFT_LEN.value,
     drift_weight=_DRIFT_WEIGHT.value,
     hf_diff_weight=_HF_DIFF_WEIGHT.value,
+    steps_per_loop=_STEPS_PER_LOOP.value,
+    compilation_cache_dir=_COMPILATION_CACHE_DIR.value,
+    matmul_precision=_MATMUL_PRECISION.value,
   )
 
 

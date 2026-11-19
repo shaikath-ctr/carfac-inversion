@@ -14,7 +14,10 @@ import json
 import logging
 import math
 import pathlib
+from collections.abc import Mapping
 from collections.abc import Sequence
+from typing import Any
+from typing import cast
 
 import flax.linen as nn
 import jax
@@ -396,7 +399,7 @@ class NapResidualRefiner(nn.Module):
 
 def save_refiner_checkpoint(
   path: str | pathlib.Path,
-  params: dict,
+  params: Mapping[str, Any],
   config: NeuralRefinerConfig,
 ) -> None:
   """Saves ``params`` and ``config`` into a self-contained ``.npz`` checkpoint."""
@@ -407,13 +410,13 @@ def save_refiner_checkpoint(
     k: np.asarray(v, dtype=np.float32) for k, v in flat.items()
   }
   payload["__config_json__"] = np.asarray(config.to_json())
-  np.savez_compressed(out_path, **payload)
+  np.savez_compressed(out_path, **cast(dict[str, Any], payload))
 
 
 @functools.lru_cache(maxsize=8)
 def _load_refiner_cached(
   resolved_path: str, mtime_ns: int
-) -> tuple[NapResidualRefiner, dict, NeuralRefinerConfig]:
+) -> tuple[NapResidualRefiner, dict[str, Any], NeuralRefinerConfig]:
   del mtime_ns
   with np.load(resolved_path, allow_pickle=False) as data:
     config = NeuralRefinerConfig.from_json(str(data["__config_json__"].item()))
@@ -429,7 +432,7 @@ def _load_refiner_cached(
 
 def load_refiner_checkpoint(
   path: str | pathlib.Path,
-) -> tuple[NapResidualRefiner, dict, NeuralRefinerConfig]:
+) -> tuple[NapResidualRefiner, dict[str, Any], NeuralRefinerConfig]:
   """Loads a saved ``.npz`` checkpoint, caching by resolved path and mtime."""
   p = pathlib.Path(path).resolve()
   if not p.is_file():
@@ -440,27 +443,35 @@ def load_refiner_checkpoint(
 @functools.partial(jax.jit, static_argnames=("model",))
 def _apply_refiner_jit(
   model: NapResidualRefiner,
-  params: dict,
+  params: Mapping[str, Any],
   ws_wave: jnp.ndarray,
   target_nap_c: jnp.ndarray,
   ws_nap_c: jnp.ndarray,
 ) -> jnp.ndarray:
-  return model.apply(params, ws_wave, target_nap_c, ws_nap_c)
+  return cast(jnp.ndarray, model.apply(params, ws_wave, target_nap_c, ws_nap_c))
 
 
 def _refine_single_window(
   model: NapResidualRefiner,
-  params: dict,
+  params: Mapping[str, Any],
   ws_win: np.ndarray,
   tgt_win: np.ndarray,
   rest_nap_j: jnp.ndarray,
   proj_w_j: jnp.ndarray,
   cochlea_model: cochlea.CochleaModel,
+  *,
+  prefix_ws: np.ndarray | None = None,
 ) -> np.ndarray:
   """Runs one window ``(win_samples, ears)`` through the neural refiner."""
   n_ears = ws_win.shape[1]
   ws_j = jnp.asarray(ws_win, dtype=jnp.float32)
-  ws_nap_raw = cochlea_model(ws_j)
+  if prefix_ws is not None and prefix_ws.shape[0] > 0:
+    prefix_j = jnp.asarray(prefix_ws, dtype=jnp.float32)
+    ws_nap_raw = cochlea_model(jnp.concatenate([prefix_j, ws_j], axis=0))[
+      prefix_ws.shape[0] :
+    ]
+  else:
+    ws_nap_raw = cochlea_model(ws_j)
   tgt_j = jnp.asarray(tgt_win, dtype=jnp.float32)
 
   # Project centered NAPs to canonical CF bins and stack ears along batch.
@@ -482,6 +493,7 @@ def refine_waveform(
   *,
   chunk_seconds: float | None = 1.5,
   chunk_overlap_s: float = 0.128,
+  chunk_preroll_s: float = 0.128,
   expected_mode: str | None = None,
 ) -> np.ndarray:
   """Applies a trained Phase 3 neural residual refiner to ``warm_start``.
@@ -497,6 +509,8 @@ def refine_waveform(
     chunk_seconds: Optional fixed OLA window length in seconds so XLA compiles
       once for arbitrary-duration clips.
     chunk_overlap_s: Cosine-squared overlap blend duration in seconds.
+    chunk_preroll_s: Preceding warm-start audio context in seconds prepended
+      when computing ``ws_nap`` for OLA chunks so CARFAC AGC states match.
     expected_mode: Optional inversion mode (``"exact"`` or ``"perceptual"``);
       logs a warning if the checkpoint's ``target_mode`` differs.
 
@@ -543,6 +557,7 @@ def refine_waveform(
   win_len = max(256, chunk_samples)
   fade_len = min(int(round(chunk_overlap_s * fs)), win_len // 2)
   hop = max(1, win_len - fade_len)
+  pre_roll = min(max(0, int(round(chunk_preroll_s * fs))), hop)
   num_chunks = max(1, math.ceil(max(0, t_len - win_len) / hop) + 1)
   padded_len = (num_chunks - 1) * hop + win_len
 
@@ -566,6 +581,12 @@ def refine_waveform(
   for chunk_idx in range(num_chunks):
     start = chunk_idx * hop
     end = start + win_len
+    if pre_roll == 0:
+      prefix_ws = None
+    elif chunk_idx == 0:
+      prefix_ws = np.zeros((pre_roll, n_ears), dtype=np.float32)
+    else:
+      prefix_ws = ws_pad[start - pre_roll : start]
     win_out = _refine_single_window(
       model,
       params,
@@ -574,6 +595,7 @@ def refine_waveform(
       rest_nap_j,
       proj_w_j,
       cochlea_model,
+      prefix_ws=prefix_ws,
     )
     if fade_len > 0 and chunk_idx > 0:
       out_pad[start : start + fade_len] = (
