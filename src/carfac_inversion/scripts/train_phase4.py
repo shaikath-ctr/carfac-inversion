@@ -582,12 +582,13 @@ def _build_grain_waveform_iter(
   seconds: float,
   batch_size: int,
   seed: int,
+  level_db_spl: tuple[float, float] = (30.0, 95.0),
 ) -> Iterator[np.ndarray]:
   """Streams 1D float32 audio batches from ProcessedClips via Grain."""
   speech_src = processed.ProcessedClips(data_dir)
   transforms = (
     _ProbabilisticNoiseBlend(probability=0.35, snr_db=(5.0, 30.0)),
-    transforms_lib.NormalizeLevel(level_db_spl=(30.0, 95.0)),
+    transforms_lib.NormalizeLevel(level_db_spl=level_db_spl),
     _LevelStepTransform(probability=0.20, step_db=(-15.0, 15.0)),
     transforms_lib.CosineWindow(ramp_seconds=0.005),
     _SilenceExampleTransform(probability=0.05),

@@ -4,8 +4,13 @@ import csv
 import pathlib
 import tempfile
 
+import jax
+import jax.numpy as jnp
+import numpy as np
 from absl.testing import absltest
+from hp_acoustic.models import carfac
 
+from carfac_inversion import sai_inverter
 from carfac_inversion.scripts import benchmark_arcfac
 
 
@@ -37,6 +42,41 @@ class BenchmarkArcfacTest(absltest.TestCase):
       self.assertLen(parsed, 4)
       self.assertIn("arcfac_nap_round_trip_rel", parsed[0])
       self.assertIn("arcfac_sai_direction", parsed[0])
+
+  def test_run_arcfac_benchmark_sai_direct_smoke(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      root = pathlib.Path(tmp_dir)
+      n_ch = int(carfac.channel_frequencies_for_rate(16000).shape[0])
+      cfg = sai_inverter.SaiInverterConfig(
+        sample_rate_hz=16000.0,
+        model_dim=32,
+        stem_blocks=1,
+        decoder_blocks=1,
+        stem_mlp_dim=64,
+        decoder_mlp_dim=64,
+        output_scale=0.05,
+      )
+      model = sai_inverter.SaiDirectInverter(config=cfg)
+      params = model.init(
+        jax.random.PRNGKey(0),
+        jnp.zeros((1, 5, 1365, n_ch), dtype=jnp.float32),
+        target_samples=4000,
+      )
+      ckpt = root / "sai.npz"
+      sai_inverter.save_sai_checkpoint(ckpt, params, cfg)
+      rows = benchmark_arcfac.run_arcfac_benchmark(
+        input_dir=None,
+        output_dir=str(root / "out"),
+        max_clips=1,
+        clip_seconds=0.25,
+        sample_rate_hz=16000,
+        targets=("healthy",),
+        methods=("sai_direct",),
+        sai_checkpoint=str(ckpt),
+        seed=0,
+      )
+      self.assertLen(rows, 1)
+      self.assertTrue(np.isfinite(float(rows[0]["arcfac_sai_round_trip_rel"])))
 
   def test_missing_arcfac_raises_clear_import_error(self):
     with self.assertRaisesRegex(ImportError, "arcfac"):

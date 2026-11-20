@@ -27,15 +27,31 @@ Build a world-class, state-of-the-art CARFAC neural activity pattern (NAP)-to-au
 
 ---
 
-## Baseline Status (Day 1)
+## Completed Milestones (Phases 4, 5, & 5b)
+
+- **16-TPU MLCR Runtime (`mlcr_tpu_launcher.py`)**: Verified `vlp:4x4` (16 TPU devices, `Mesh('data': 16)`) and updated launcher defaults to `--base_slice=vlp:4x4` with `--max_clips`, `--phase4_checkpoint`, `--sai_checkpoint`, and `--healthy_warmup_steps`.
+- **Phase 4 (`tc100_gan_v1`, `CochleaDirectInverter` + 1D MPD/MRD GAN)**:
+  - Scaled `cochlea_hybrid` on `librispeech_train_clean_100_32k` + 400-step Stage-2 1D GAN fine-tuning (`bc6c0ac`), reaching **`+24.53 dB` SI-SDR / `0.954` HASQI / `0.071` `nap_rt_rel` / `0.048` `sai_rt_rel` / `0.032` `log_stft`** on `dev-clean/test` (`3.6x` lower `nap_rt_rel`, `4.3x` lower `sai_rt_rel`, and `+13.20 dB` higher SI-SDR than `arcfac` `tcn`), and **`+21.62 dB` SI-SDR / `0.929` HASQI** zero-shot on `train-clean-100/test`.
+  - On `1.0 s @ 32 kHz` real speech (`65 dB SPL`), outperforms iterative `arcfac_match_nap` across every metric (`nap_rt_rel` `0.065` vs `0.368–0.400`, `sai_rt_rel` `0.056` vs `0.253–0.305`, `log_stft` `0.106` vs `0.531–2.538`, `SI-SDR` `+17.82 dB` vs `-10.02..-7.75 dB`, `HASQI` `0.912` vs `0.064–0.159`, `flat:0.5 nap_kept` `0.170` vs `0.338–0.407`) at `~340x` faster warm inference (`0.40 s` vs `~137 s`).
+- **Phase 5 (`cochlea_clinical_32k_v1`, Clinical Audiology & Inverse Prescriptions)**:
+  - Added `Bisgaard` (`N1–N4`, `S1–S3`) and `ISO 7029` audiograms + differentiable JAX `HASQI`/`HASPI` losses (`clinical.py`, `perceptual_losses.py`, `train_phase5.py`, `benchmark_phase5.py`).
+  - Achieved positive CARFAC NAP healing (**`+7.9%` to `+41.7%`**) across all 8 profiles and `50/65/80 dB SPL` (vs `NAL-R` `-21.1%` to `+1.1%`) and lifted severe `bisgaard:N4` `HASPI` (`0.297 -> 0.863` vs `NAL-R` `0.765`).
+- **Phase 5b (`sai_vocos_32k_v1`, Direct Generative `SAI → Audio`)**:
+  - Built `SaiDirectInverter` (`5.26M` params: high-CF unresolved harmonic-summed SACF pitch + DDSP `48`-harmonic bank + COLA `n_fft=1024, hop=128` STFT-filtered white noise + chunked modular phase integration) and Stage 1 + 1D MPD/MRD GAN training (`sai_inverter.py`, `train_sai.py`).
+  - On unseen `dev-clean/test` (`7976-105575-0000`, `2.0 s @ 32 kHz`), outperforms `AFHI/arcfac` SAI baselines on **`HASQI` (`0.500` vs `0.344` `randphase` / `0.272` `noise` / `0.177` `slaney`)**, **`log_stft` (`0.181` vs `0.468 / 2.238 / 1.802`)**, **`STOI` (`0.912`)**, **`HASPI` (`0.860`)**, `flat:0.5` direction (`sai_dir = 1.006`, `sai_kept = 0.055`), **`sai_rt_rel` vs `arcfac_slaney` (`0.361` vs `0.856`)**, and **`>10,000x` faster warm inference (`0.08 s` vs `798–856 s`)**.
+  - Generalizes across `5`-clip `dev-clean/test` (`HASQI = 0.472`, `log_stft = 0.164`, `sai_rt_rel = 0.390`), `train-clean-100/test` (`HASQI = 0.415`, `sai_rt_rel = 0.364`, `flat:0.5 sai_kept = 0.033`, `sai_dir = 1.004`), and `30–95 dB SPL` (`HASQI = 0.576 -> 0.322`, `sai_rt_rel = 0.453 -> 0.330`).
+
+---
+
+## Environment & Reference Summary
 
 ### Environment Setup
 - **Target Repository**: `/usr/local/google/home/shaikath/Projects/carfac-inversion`
 - **Virtual Environment**: `.venv` synchronized via `uv` using Python 3.12.16 (`cpython-3.12.16-linux-x86_64-gnu`).
-- **Dependencies Status**: All 103 packages installed and verified (`carfac[jax]` @ `4cdb95e`, `hp-acoustic` @ `7d913ac`, `jax-haspi-hasqi` @ `f6601d4`, `jax==0.10.2`, `jaxlib==0.10.2`, `optax==0.2.9`, `grain`, `pystoi`, `pytest==9.2.0`, `ruff==0.17.5`).
-- **Test Suite Verification**: **34 / 34 tests passing** verified across `inversion_test.py` (17), `neural_test.py` (7), `benchmark_suite_test.py` (6), and `invert_nap_test.py` (4).
+- **Dependencies Status**: All packages installed and verified (`carfac[jax]` @ `4cdb95e`, `hp-acoustic` @ `7d913ac`, `jax-haspi-hasqi` @ `f6601d4`, `jax==0.10.2`, `jaxlib==0.10.2`, `optax==0.2.9`, `grain`, `pystoi`, `pytest==9.2.0`, `ruff==0.17.5`).
+- **Test Suite Verification**: **73 / 73 tests passing** (`ruff format --check .`, `ruff check .`, `pyrefly check`, and `pytest -v` all clean).
 
-### Existing Benchmark Reference Metrics (Phases 0–3b)
+### Historical Reference Metrics (Phases 0–3b)
 - **Phase 0–3b Test Suite**: 34 tests defined across `inversion_test.py` (17), `neural_test.py` (7), `benchmark_suite_test.py` (6), and `invert_nap_test.py` (4).
 - **Phase 3 (Exact Mode) Headline Results** (4 held-out LibriSpeech speakers):
   - 50 dB clean: `19.39 dB` SI-SDR (`0+0` DSP+Neural, 3.08 s) / `19.44 dB` (`0+15` Hybrid, 15.89 s).
@@ -49,5 +65,5 @@ Build a world-class, state-of-the-art CARFAC neural activity pattern (NAP)-to-au
 
 ---
 
-## Immediate Next Action
-- **Phase 4 Plan**: Data pipeline scaling & Generative HF excitation design (HF Phase & Comb Carrier Synthesis).
+## Next Action
+- **Phase 6**: Low-latency causal streaming (`<20 ms`) & scaling `SaiDirectInverter` on `16`-TPU `vlp:4x4` slices for longer horizons to close the remaining pixel-`sai_rt_rel` gap to iterative per-clip waveform optimization (`0.114`) while preserving `0.08 s` feedforward speed and superior `HASQI`/`log_stft`.
