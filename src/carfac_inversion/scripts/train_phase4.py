@@ -7,6 +7,7 @@ tests), synthesizes healthy and impaired target CARFAC NAPs on TPU HBM via
 NAP-to-audio models inside multi-step ``jax.lax.scan`` loops.
 """
 
+import contextlib
 import csv
 import dataclasses
 import gc
@@ -14,6 +15,7 @@ import json
 import math
 import pathlib
 import time
+from collections.abc import Callable
 from collections.abc import Iterator
 from collections.abc import Mapping
 from collections.abc import Sequence
@@ -37,6 +39,7 @@ from hp_acoustic.models import carfac
 from carfac_inversion import arcfac_metrics
 from carfac_inversion import nap_inverter
 from carfac_inversion import neural
+from carfac_inversion import sai_inverter
 from carfac_inversion import tpu
 from carfac_inversion import vocoder_losses
 from carfac_inversion.scripts import benchmark_suite
@@ -78,6 +81,17 @@ _EARS: flags.FlagHolder[str]
 _SHARE_HEALTHY: flags.FlagHolder[float]
 _SHARE_FLAT: flags.FlagHolder[float]
 _MIDDLE_EAR: flags.FlagHolder[bool]
+_DISPERSION_ALIGN: flags.FlagHolder[bool]
+_ZERO_RESTING_GATE: flags.FlagHolder[bool]
+_TONE_SHARE: flags.FlagHolder[float]
+_EXCESS_STFT_WEIGHT: flags.FlagHolder[float]
+_EXCESS_ALL_EARS: flags.FlagHolder[bool]
+_NAP_WEIGHT: flags.FlagHolder[float]
+_RELATIVE_NAP: flags.FlagHolder[bool]
+_MEL_WEIGHT: flags.FlagHolder[float]
+_LF_COMPLEX_WEIGHT: flags.FlagHolder[float]
+_RMS_ENV_WEIGHT: flags.FlagHolder[float]
+_STROBE_SAI_INPUT: flags.FlagHolder[bool]
 _EVAL_EVERY: flags.FlagHolder[int]
 _EVAL_CLIPS: flags.FlagHolder[int]
 _SCORE_SECONDS: flags.FlagHolder[float]
@@ -123,6 +137,17 @@ def define_flags(flag_values: flags.FlagValues = FLAGS) -> None:
   global _SHARE_HEALTHY
   global _SHARE_FLAT
   global _MIDDLE_EAR
+  global _DISPERSION_ALIGN
+  global _ZERO_RESTING_GATE
+  global _TONE_SHARE
+  global _EXCESS_STFT_WEIGHT
+  global _EXCESS_ALL_EARS
+  global _NAP_WEIGHT
+  global _RELATIVE_NAP
+  global _MEL_WEIGHT
+  global _LF_COMPLEX_WEIGHT
+  global _RMS_ENV_WEIGHT
+  global _STROBE_SAI_INPUT
   global _EVAL_EVERY
   global _EVAL_CLIPS
   global _SCORE_SECONDS
@@ -330,6 +355,72 @@ def define_flags(flag_values: flags.FlagValues = FLAGS) -> None:
     "middle_ear",
     False,
     "Enable middle-ear filter symmetrically on target and healthy ears.",
+    flag_values=flag_values,
+  )
+  _DISPERSION_ALIGN = flags.DEFINE_boolean(
+    "dispersion_align",
+    False,
+    "Enable causal basal-delay dispersion alignment in CochleaDirectInverter.",
+    flag_values=flag_values,
+  )
+  _ZERO_RESTING_GATE = flags.DEFINE_boolean(
+    "zero_resting_gate",
+    False,
+    "Enable causal resting-silence AC fluctuation gate on decoder output.",
+    flag_values=flag_values,
+  )
+  _TONE_SHARE = flags.DEFINE_float(
+    "tone_share",
+    0.0,
+    "Probability of replacing a batch clip with a synthetic pure/harmonic tone.",
+    flag_values=flag_values,
+  )
+  _EXCESS_STFT_WEIGHT = flags.DEFINE_float(
+    "excess_stft_weight",
+    0.0,
+    "Asymmetric excess log-STFT penalty weight on healthy (or all) targets.",
+    flag_values=flag_values,
+  )
+  _EXCESS_ALL_EARS = flags.DEFINE_boolean(
+    "excess_all_ears",
+    False,
+    "Apply spectral_excess_loss against clean speech on impaired ears too.",
+    flag_values=flag_values,
+  )
+  _NAP_WEIGHT = flags.DEFINE_float(
+    "nap_weight",
+    1.0,
+    "Weight on sample-aligned CARFAC NAP L1 loss (0 skips cochlea backward).",
+    flag_values=flag_values,
+  )
+  _RELATIVE_NAP = flags.DEFINE_boolean(
+    "relative_nap",
+    False,
+    "Normalize each clip NAP L1 loss by target steady-state NAP magnitude.",
+    flag_values=flag_values,
+  )
+  _MEL_WEIGHT = flags.DEFINE_float(
+    "mel_weight",
+    0.0,
+    "Phase-invariant multi-scale log-mel L1 loss weight on healthy targets.",
+    flag_values=flag_values,
+  )
+  _LF_COMPLEX_WEIGHT = flags.DEFINE_float(
+    "lf_complex_weight",
+    0.0,
+    "Low-frequency (<900 Hz) complex STFT L2 loss weight on healthy targets.",
+    flag_values=flag_values,
+  )
+  _RMS_ENV_WEIGHT = flags.DEFINE_float(
+    "rms_env_weight",
+    0.0,
+    "Multi-scale log-RMS envelope L1 loss weight on healthy targets.",
+    flag_values=flag_values,
+  )
+  _STROBE_SAI_INPUT = flags.DEFINE_boolean(
+    "strobe_sai_input",
+    False,
+    "Condition decoder on causal strobe SAI -> NAP reconstructions instead of clean NAPs.",
     flag_values=flag_values,
   )
   _EVAL_EVERY = flags.DEFINE_integer(
@@ -616,12 +707,48 @@ def _build_grain_waveform_iter(
         it = iter(ds)
 
 
+def _synthesize_tonal_clip(
+  rng: np.random.Generator,
+  num_samples: int,
+  sample_rate_hz: int,
+) -> np.ndarray:
+  """Generates a pure sine or harmonic tone calibrated to ``35-90 dB SPL``."""
+  t = np.arange(num_samples, dtype=np.float64) / float(sample_rate_hz)
+  if rng.random() < 0.5:
+    freq = float(np.exp(rng.uniform(math.log(80.0), math.log(6000.0))))
+    phase = float(rng.uniform(0.0, 2.0 * math.pi))
+    sig = np.sin(2.0 * math.pi * freq * t + phase)
+  else:
+    f0 = float(rng.uniform(85.0, 320.0))
+    sig = np.zeros(num_samples, dtype=np.float64)
+    for k in range(1, 20):
+      fk = k * f0
+      if fk >= 0.45 * float(sample_rate_hz):
+        break
+      sig += (1.0 / (k**1.15)) * np.sin(
+        2.0 * math.pi * fk * t + float(rng.uniform(0.0, 2.0 * math.pi))
+      )
+  ramp = min(
+    num_samples // 4, max(1, int(round(0.005 * float(sample_rate_hz))))
+  )
+  taper = np.sin(0.5 * np.pi * np.arange(ramp, dtype=np.float64) / ramp) ** 2
+  sig[:ramp] *= taper
+  sig[-ramp:] *= taper[::-1]
+  rms = max(float(np.sqrt(np.mean(sig**2))), 1e-8)
+  spl = float(rng.uniform(35.0, 90.0))
+  tgt_rms = 10.0 ** (
+    (spl - float(benchmark_suite.CARFAC_RMS_ONE_DB_SPL)) / 20.0
+  )
+  return (sig * (tgt_rms / rms)).astype(np.float32)
+
+
 def _iter_training_batches(
   *,
   wave_iter: Iterator[np.ndarray],
   rng: np.random.Generator,
   num_channels: int,
   cfs: np.ndarray,
+  sample_rate_hz: int,
   ears_mode: str,
   share_healthy: float,
   share_flat: float,
@@ -630,12 +757,18 @@ def _iter_training_batches(
   lam_healthy: float,
   lam_impaired: float,
   stft_weight: float,
+  tone_share: float = 0.0,
 ) -> Iterator[
   tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
 ]:
   """Pairs raw 1D waveforms with lightweight per-clip ear and loss masks."""
   for wav in wave_iter:
-    bsz = wav.shape[0]
+    wav_arr = np.array(wav, dtype=np.float32, copy=True)
+    bsz, n_samp = wav_arr.shape
+    if tone_share > 0.0:
+      for b in range(bsz):
+        if rng.random() < tone_share:
+          wav_arr[b] = _synthesize_tonal_clip(rng, n_samp, sample_rate_hz)
     ohc, shift, is_healthy = _draw_listener_batch(
       rng,
       bsz,
@@ -649,7 +782,7 @@ def _iter_training_batches(
     )
     lam_b = np.where(is_healthy, lam_healthy, lam_impaired).astype(np.float32)
     stft_b = np.where(is_healthy, stft_weight, 0.0).astype(np.float32)
-    yield wav, ohc, shift, lam_b, stft_b
+    yield wav_arr, ohc, shift, lam_b, stft_b
 
 
 def _evaluate_phase4(
@@ -665,6 +798,8 @@ def _evaluate_phase4(
   out_root: pathlib.Path,
   step_idx: int,
   mesh: jax.sharding.Mesh | None = None,
+  input_transform_fn: Callable[[jnp.ndarray], jnp.ndarray] | None = None,
+  selection_metric: str = "nap",
 ) -> dict[str, Any]:
   """Evaluates ``params`` on ``healthy`` & ``flat:0.5`` using ``arcfac.score``."""
   forward_jit = jax.jit(lambda w, cm: cm(w[:, None])[:, :, 0])
@@ -705,9 +840,10 @@ def _evaluate_phase4(
         if target_name == "healthy"
         else np.asarray(forward_jit(_place(x_pad), tgt_cm), dtype=np.float32)
       )
-      y_pad = np.asarray(
-        apply_fn(params, _place(nap_pad[None]))[0], dtype=np.float32
-      )
+      model_in = _place(nap_pad[None])
+      if input_transform_fn is not None:
+        model_in = input_transform_fn(model_in)
+      y_pad = np.asarray(apply_fn(params, model_in)[0], dtype=np.float32)
       y = y_pad[lookahead : lookahead + len(x)]
       n_tgt = nap_pad[: len(x)]
       y_eval_pad = np.concatenate([y, np.zeros(lookahead, dtype=np.float32)])
@@ -759,11 +895,14 @@ def _evaluate_phase4(
     float(np.nanmean(sai_dir_vals)) if sai_dir_vals else float("nan")
   )
   mean_sdr = float(np.nanmean(sdr_vals)) if sdr_vals else float("nan")
-  score_proxy = (
-    mean_rt + mean_kept
-    if np.isfinite(mean_rt) and np.isfinite(mean_kept)
-    else mean_rt
-  )
+  if selection_metric == "sai":
+    score_proxy = mean_sai_rt
+  else:
+    score_proxy = (
+      mean_rt + mean_kept
+      if np.isfinite(mean_rt) and np.isfinite(mean_kept)
+      else mean_rt
+    )
   scores["summary"] = {
     "nap_round_trip_rel": mean_rt,
     "sai_round_trip_rel": mean_sai_rt,
@@ -836,6 +975,17 @@ def run_phase4_training(
   share_healthy: float = 0.25,
   share_flat: float = 0.35,
   middle_ear_enabled: bool = False,
+  dispersion_align: bool = False,
+  zero_resting_gate: bool = False,
+  tone_share: float = 0.0,
+  excess_stft_weight: float = 0.0,
+  excess_all_ears: bool = False,
+  nap_weight: float = 1.0,
+  relative_nap: bool = False,
+  mel_weight: float = 0.0,
+  lf_complex_weight: float = 0.0,
+  rms_env_weight: float = 0.0,
+  strobe_sai_input: bool = False,
   eval_every: int = 250,
   eval_clips_count: int = 3,
   score_seconds: float = 2.0,
@@ -918,19 +1068,38 @@ def run_phase4_training(
     )
 
   # Calibrate input/output scales on a healthy batch just like arcfac.nap.train.
+  strobe_in_fn = (
+    sai_inverter.build_causal_strobe_sai_nap_fn(
+      float(sample_rate_hz), num_channels, mesh=mesh
+    )
+    if strobe_sai_input
+    else None
+  )
+  strobe_in_jit = jax.jit(strobe_in_fn) if strobe_in_fn is not None else None
   calib_x_np = next(wave_iter)
   # Ensure non-silent calibration energy if SilenceExample drew a silent batch.
   if float(np.sqrt(np.mean(calib_x_np**2))) < 1e-6:
     calib_x_np = next(wave_iter)
   healthy_ear_fn = jax.jit(jax.vmap(lambda w: healthy_dev(w[:, None])[:, :, 0]))
   calib_nap = healthy_ear_fn(tpu.shard_batch(calib_x_np, mesh, stacked=False))
-  input_scale = max(float(jnp.sqrt(jnp.mean(calib_nap**2))), 1e-6)
+  calib_in = (
+    strobe_in_jit(calib_nap) if strobe_in_jit is not None else calib_nap
+  )
+  input_scale = max(float(jnp.sqrt(jnp.mean(calib_in**2))), 1e-6)
   output_scale = max(float(np.sqrt(np.mean(calib_x_np**2))), 1e-6)
 
   if init_checkpoint:
     model, init_params_raw, cfg = nap_inverter.load_direct_checkpoint(
       init_checkpoint
     )
+    cfg_updates: dict[str, Any] = {}
+    if zero_resting_gate and not cfg.zero_resting_gate:
+      cfg_updates["zero_resting_gate"] = True
+    if dispersion_align and not cfg.dispersion_align:
+      cfg_updates["dispersion_align"] = True
+    if cfg_updates:
+      cfg = dataclasses.replace(cfg, **cfg_updates)
+      model = nap_inverter.CochleaDirectInverter(config=cfg)
     init_params_host = tpu.to_host_tree(init_params_raw)
   else:
     cfg = nap_inverter.DirectInverterConfig(
@@ -945,6 +1114,8 @@ def run_phase4_training(
       lookahead=lookahead,
       output_highpass_hz=output_highpass_hz,
       fs=float(sample_rate_hz),
+      dispersion_align=dispersion_align,
+      zero_resting_gate=zero_resting_gate,
     )
     model = nap_inverter.CochleaDirectInverter(config=cfg)
     with tpu.host_cpu_context():
@@ -954,6 +1125,9 @@ def run_phase4_training(
         jnp.zeros((1, min(1024, num_samples), num_channels), dtype=jnp.float32),
       )
       init_params_host = tpu.to_host_tree(raw_p)
+
+  if cfg.dispersion_align:
+    nap_inverter.compute_open_loop_bm_delays(float(cfg.fs), num_channels)
 
   params = cast(Mapping[str, Any], tpu.replicate_tree(init_params_host, mesh))
   n_params = sum(p.size for p in jax.tree_util.tree_leaves(params))
@@ -966,6 +1140,11 @@ def run_phase4_training(
   )
   stft_res = vocoder_losses.stft_resolutions_for_rate(float(sample_rate_hz))
   apply_stft = stft_weight > 0.0
+  apply_excess_stft = excess_stft_weight > 0.0
+  apply_mel = mel_weight > 0.0
+  apply_lf_complex = lf_complex_weight > 0.0
+  apply_rms_env = rms_env_weight > 0.0
+  selection_metric = "sai" if nap_weight <= 0.0 else "nap"
 
   config_payload = {
     "architecture": architecture,
@@ -977,6 +1156,17 @@ def run_phase4_training(
     "lam": lam,
     "lam_impaired": lam_impaired,
     "stft_weight": stft_weight,
+    "excess_stft_weight": excess_stft_weight,
+    "excess_all_ears": excess_all_ears,
+    "nap_weight": nap_weight,
+    "relative_nap": relative_nap,
+    "mel_weight": mel_weight,
+    "lf_complex_weight": lf_complex_weight,
+    "rms_env_weight": rms_env_weight,
+    "tone_share": tone_share,
+    "strobe_sai_input": strobe_sai_input,
+    "dispersion_align": dispersion_align,
+    "zero_resting_gate": zero_resting_gate,
     "sai_weight": sai_weight,
     "warmup_weight": warmup_weight,
     "lr": lr,
@@ -1032,8 +1222,15 @@ def run_phase4_training(
     tgt_nap: jnp.ndarray,
     lam_b: jnp.ndarray,
     stft_b: jnp.ndarray,
+    excess_b: jnp.ndarray,
+    healthy_w: jnp.ndarray,
   ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
-    y_b = cast(jnp.ndarray, model.apply(p, tgt_nap))
+    in_nap = (
+      jax.lax.stop_gradient(strobe_in_fn(tgt_nap))
+      if strobe_in_fn is not None
+      else tgt_nap
+    )
+    y_b = cast(jnp.ndarray, model.apply(p, in_nap))
     return vocoder_losses.compute_arcfac_inverter_loss(
       y_b,
       x_b,
@@ -1042,10 +1239,21 @@ def run_phase4_training(
       lookahead=lookahead,
       mask_samples=mask_samples,
       output_scale=output_scale,
+      nap_weight=nap_weight,
+      relative_nap=relative_nap,
       lam=lam_b,
       warmup_weight=warmup_weight,
       stft_weight=stft_b,
       apply_stft=apply_stft,
+      excess_stft_weight=excess_b,
+      apply_excess_stft=apply_excess_stft,
+      mel_weight=healthy_w * jnp.float32(mel_weight),
+      apply_mel=apply_mel,
+      lf_complex_weight=healthy_w * jnp.float32(lf_complex_weight),
+      apply_lf_complex=apply_lf_complex,
+      rms_env_weight=healthy_w * jnp.float32(rms_env_weight),
+      apply_rms_env=apply_rms_env,
+      sample_rate_hz=float(sample_rate_hz),
       sai_weight=sai_weight,
       stft_resolutions=stft_res,
     )
@@ -1068,6 +1276,10 @@ def run_phase4_training(
         "l1_waveform",
         "warmup_energy",
         "stft",
+        "excess_stft",
+        "mel",
+        "lf_complex",
+        "rms_env",
       )
     }
 
@@ -1080,8 +1292,14 @@ def run_phase4_training(
       g_acc, m_acc = carry
       x_b, ohc_b, shift_b, lam_b, stft_b = micro
       tgt_nap = jax.lax.stop_gradient(target_naps_jit(x_b, ohc_b, shift_b))
+      healthy_w = (jnp.min(ohc_b, axis=1) > 0.999).astype(jnp.float32)
+      excess_b = (
+        jnp.full((x_b.shape[0],), excess_stft_weight, dtype=jnp.float32)
+        if excess_all_ears
+        else healthy_w * jnp.float32(excess_stft_weight)
+      )
       (val, parts), grads = jax.value_and_grad(_step_loss, has_aux=True)(
-        p, x_b, tgt_nap, lam_b, stft_b
+        p, x_b, tgt_nap, lam_b, stft_b, excess_b, healthy_w
       )
       next_g = jax.tree.map(jnp.add, g_acc, grads)
       step_m = {"loss": val, **parts}
@@ -1134,6 +1352,7 @@ def run_phase4_training(
     rng=np_rng,
     num_channels=num_channels,
     cfs=cfs,
+    sample_rate_hz=sample_rate_hz,
     ears_mode=ears,
     share_healthy=share_healthy,
     share_flat=share_flat,
@@ -1142,6 +1361,7 @@ def run_phase4_training(
     lam_healthy=lam,
     lam_impaired=lam_impaired,
     stft_weight=stft_weight,
+    tone_share=tone_share,
   )
 
   ckpt_path = out_root / "checkpoint.npz"
@@ -1163,6 +1383,8 @@ def run_phase4_training(
     out_root=out_root,
     step_idx=0,
     mesh=mesh,
+    input_transform_fn=strobe_in_jit,
+    selection_metric=selection_metric,
   )
   print(f"[Phase 4 step 0] {json.dumps(step0_scores)}", flush=True)
   best_scores = step0_scores
@@ -1228,11 +1450,16 @@ def run_phase4_training(
               f"{dt:.3f}",
             )
           )
+        extra = (
+          f" mel={last_metrics['mel']:.4g} lf={last_metrics['lf_complex']:.4g}"
+          if (apply_mel or apply_lf_complex)
+          else ""
+        )
         print(
           f"[Phase 4 step {step:4d}/{steps}] loss={last_metrics['loss']:.5g} "
           f"nap={last_metrics['nap_l1']:.5g} sai={last_metrics['sai_l1']:.4g} "
           f"wave={last_metrics['l1_waveform']:.4g} warm={last_metrics['warmup_energy']:.4g} "
-          f"stft={last_metrics['stft']:.4g} ({dt:.2f}s)",
+          f"stft={last_metrics['stft']:.4g}{extra} ({dt:.2f}s)",
           flush=True,
         )
         if step % max(1, eval_every) == 0 or step == steps:
@@ -1248,6 +1475,8 @@ def run_phase4_training(
             out_root=out_root,
             step_idx=step,
             mesh=mesh,
+            input_transform_fn=strobe_in_jit,
+            selection_metric=selection_metric,
           )
           print(f"[Phase 4 eval {step}] {json.dumps(sc_sum)}", flush=True)
           if (
@@ -1261,6 +1490,9 @@ def run_phase4_training(
               ckpt_path, best_params_host, cfg
             )
 
+    nap_inverter.save_direct_checkpoint(
+      out_root / "checkpoint_last.npz", tpu.to_host_tree(params), cfg
+    )
     tpu.delete_tree(opt_state)
     gc.collect()
 
@@ -1350,12 +1582,17 @@ def run_phase4_training(
         ],
       ) -> tuple[
         tuple[jnp.ndarray, Mapping[str, Any]],
-        tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
+        tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
       ]:
         d_sum, dg_sum = carry_d
         x_b, ohc_b, shift_b, _, _ = micro
         healthy_mask = (jnp.min(ohc_b, axis=1) > 0.999).astype(jnp.float32)
         tgt_nap = jax.lax.stop_gradient(target_naps_jit(x_b, ohc_b, shift_b))
+        in_nap = (
+          jax.lax.stop_gradient(strobe_in_fn(tgt_nap))
+          if strobe_in_fn is not None
+          else tgt_nap
+        )
         x_delayed = vocoder_losses.delay_samples(x_b, lookahead, axis=1)
         # Normalize amplitude entering D using steady-state RMS across 30-95 dB.
         clip_norm_rms = jnp.maximum(
@@ -1365,7 +1602,7 @@ def run_phase4_training(
           0.1 * output_scale,
         )
         y_fake = jax.lax.stop_gradient(
-          cast(jnp.ndarray, model.apply(gp, tgt_nap))
+          cast(jnp.ndarray, model.apply(gp, in_nap))
         )
         d_val_i, d_grad_i = jax.value_and_grad(_d_loss_micro)(
           dp, x_delayed, y_fake, clip_norm_rms, healthy_mask
@@ -1373,7 +1610,7 @@ def run_phase4_training(
         return (
           d_sum + d_val_i,
           jax.tree.map(jnp.add, dg_sum, d_grad_i),
-        ), (tgt_nap, x_delayed, clip_norm_rms, healthy_mask)
+        ), (tgt_nap, in_nap, x_delayed, clip_norm_rms, healthy_mask)
 
       zero_d_grads = jax.tree.map(jnp.zeros_like, dp)
       (d_val_sum, d_grads_sum), cached = jax.lax.scan(
@@ -1388,13 +1625,19 @@ def run_phase4_training(
         g_p: Mapping[str, Any],
         x_b: jnp.ndarray,
         tgt_nap: jnp.ndarray,
+        in_nap: jnp.ndarray,
         lam_b: jnp.ndarray,
         stft_b: jnp.ndarray,
         x_delayed: jnp.ndarray,
         clip_norm_rms: jnp.ndarray,
         healthy_mask: jnp.ndarray,
       ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
-        y_b = cast(jnp.ndarray, model.apply(g_p, tgt_nap))
+        y_b = cast(jnp.ndarray, model.apply(g_p, in_nap))
+        gan_excess_w = (
+          jnp.full((x_b.shape[0],), excess_stft_weight, dtype=jnp.float32)
+          if excess_all_ears
+          else healthy_mask * jnp.float32(excess_stft_weight)
+        )
         base_loss, parts = vocoder_losses.compute_arcfac_inverter_loss(
           y_b,
           x_b,
@@ -1403,10 +1646,21 @@ def run_phase4_training(
           lookahead=lookahead,
           mask_samples=mask_samples,
           output_scale=output_scale,
+          nap_weight=nap_weight,
+          relative_nap=relative_nap,
           lam=lam_b,
           warmup_weight=warmup_weight,
           stft_weight=stft_b,
           apply_stft=apply_stft,
+          excess_stft_weight=gan_excess_w,
+          apply_excess_stft=apply_excess_stft,
+          mel_weight=healthy_mask * jnp.float32(mel_weight),
+          apply_mel=apply_mel,
+          lf_complex_weight=healthy_mask * jnp.float32(lf_complex_weight),
+          apply_lf_complex=apply_lf_complex,
+          rms_env_weight=healthy_mask * jnp.float32(rms_env_weight),
+          apply_rms_env=apply_rms_env,
+          sample_rate_hz=float(sample_rate_hz),
           sai_weight=sai_weight,
           stft_resolutions=stft_res,
         )
@@ -1437,6 +1691,10 @@ def run_phase4_training(
           "l1_waveform",
           "warmup_energy",
           "stft",
+          "excess_stft",
+          "mel",
+          "lf_complex",
+          "rms_env",
           "adv",
           "fm",
           "d_loss",
@@ -1449,7 +1707,9 @@ def run_phase4_training(
           tuple[
             jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray
           ],
-          tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
+          tuple[
+            jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray
+          ],
         ],
       ) -> tuple[tuple[Mapping[str, Any], dict[str, jnp.ndarray]], None]:
         gg_acc, gm_acc = carry_g
@@ -1457,6 +1717,7 @@ def run_phase4_training(
           (x_b, _, _, lam_b, stft_b),
           (
             tgt_nap,
+            in_nap,
             x_delayed,
             clip_norm_rms,
             healthy_mask,
@@ -1468,6 +1729,7 @@ def run_phase4_training(
           gp,
           x_b,
           tgt_nap,
+          in_nap,
           lam_b,
           stft_b,
           x_delayed,
@@ -1513,13 +1775,20 @@ def run_phase4_training(
     )
     gan_state = (params, d_params, g_opt, d_opt)
     g_step = 0
-    with tpu.ThreadedDevicePrefetcher(
-      batch_iter, mesh, steps_per_loop=gan_scan_k, max_prefetch=2
-    ) as g_pre:
+    with contextlib.ExitStack() as stack:
+      g_pre = (
+        stack.enter_context(
+          tpu.ThreadedDevicePrefetcher(
+            batch_iter, mesh, steps_per_loop=gan_scan_k, max_prefetch=2
+          )
+        )
+        if gan_scan_k > 1
+        else None
+      )
       while g_step < gan_steps:
         t0 = time.perf_counter()
         rem = gan_steps - g_step
-        if rem >= gan_scan_k:
+        if g_pre is not None and rem >= gan_scan_k:
           chunk = next(g_pre)
           gan_state, gm_dev = gan_k_jit(gan_state, chunk)
           c_len = gan_scan_k
@@ -1556,6 +1825,8 @@ def run_phase4_training(
       out_root=out_root,
       step_idx=steps + gan_steps,
       mesh=mesh,
+      input_transform_fn=strobe_in_jit,
+      selection_metric=selection_metric,
     )
     print(f"[Phase 4 GAN eval] {json.dumps(gan_scores)}", flush=True)
     if np.isfinite(gan_scores["selection_loss"]) and (
@@ -1617,6 +1888,17 @@ def main(argv: Sequence[str]) -> None:
     share_healthy=_SHARE_HEALTHY.value,
     share_flat=_SHARE_FLAT.value,
     middle_ear_enabled=_MIDDLE_EAR.value,
+    dispersion_align=_DISPERSION_ALIGN.value,
+    zero_resting_gate=_ZERO_RESTING_GATE.value,
+    tone_share=_TONE_SHARE.value,
+    excess_stft_weight=_EXCESS_STFT_WEIGHT.value,
+    excess_all_ears=_EXCESS_ALL_EARS.value,
+    nap_weight=_NAP_WEIGHT.value,
+    relative_nap=_RELATIVE_NAP.value,
+    mel_weight=_MEL_WEIGHT.value,
+    lf_complex_weight=_LF_COMPLEX_WEIGHT.value,
+    rms_env_weight=_RMS_ENV_WEIGHT.value,
+    strobe_sai_input=_STROBE_SAI_INPUT.value,
     eval_every=_EVAL_EVERY.value,
     eval_clips_count=_EVAL_CLIPS.value,
     score_seconds=_SCORE_SECONDS.value,

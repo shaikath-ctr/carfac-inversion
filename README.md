@@ -96,15 +96,16 @@ optimization, and direct generative SAI-to-audio synthesis in six components:
      carry via module-level JIT kernels so XLA compiles once and runtime scales
      linearly with duration.
 4. **Direct Causal Neural Inverter ([`nap_inverter.py`](src/carfac_inversion/nap_inverter.py), [`vocoder_losses.py`](src/carfac_inversion/vocoder_losses.py), [`train_phase4.py`](src/carfac_inversion/scripts/train_phase4.py))**:
-   - **Phase 4 (`CochleaDirectInverter`, `architecture="cochlea_hybrid"`, `488,323` params)** inverts full-band `32 kHz` CARFAC NAPs directly in a single causal pass (`8 ms` / `256`-sample lookahead) with no iterative optimization loop at inference time (`~0.4–0.7 s` warm on CPU).
-   - Combines dual linear + log-compressed NAP scaling (`nap_log_scale=0.02`), a 1D band-Toeplitz-lowered `(3, 5) -> (1, 5)` causal tonotopic stem (`_CausalTonotopicStem`), a causal `2 ms` (`hop=64`) frame-rate envelope/AGC branch with FiLM + dynamic gain modulation, `nn.remat`-checkpointed dilated causal residual blocks (`width=64, num_blocks=13`), and an exact $O(\log T)$ modal `complex64` `jax.lax.associative_scan` 4th-order `20 Hz` Butterworth output high-pass (`vocoder_losses.causal_highpass`). Also implements [`arcfac`](https://github.com/Australian-Future-Hearing-Initiative/arcfac)'s baseline causal `tcn` (`229,569` params) for direct ablation.
-   - Trained end-to-end on TPU (`batch_size=64` via `grad_accum_steps=2` and multi-step `jax.lax.scan`) across streaming LibriSpeech `train-clean-100` (`ProcessedClips` via Grain) + Stage-2 1D Multi-Period + Multi-Resolution STFT (`MPD` + `MRD`) adversarial fine-tuning (`--gan_steps`) using randomized healthy/flat/sloping ears (`ears="mixture"` `0.25/0.35/0.40`, `mask=8000` / `0.25 s`, `warmup_weight=0.01`, healthy-only `lam=0.01` and MR-STFT `stft_weight=0.1`, `lam_impaired=0.0`).
+   - **Phase 4 (`CochleaDirectInverter`, `architecture="cochlea_hybrid"`, `488,323` params)** inverts full-band `32 kHz` CARFAC NAPs directly in a single causal pass (`8 ms` / `256`-sample lookahead) with no iterative optimization loop at inference time (`~0.4–0.8 s` warm on CPU).
+   - Combines dual linear + log-compressed NAP scaling (`nap_log_scale=0.02`), a 1D band-Toeplitz-lowered `(3, 5) -> (1, 5)` causal tonotopic stem (`_CausalTonotopicStem`), a causal `2 ms` (`hop=64`) frame-rate envelope/AGC branch with FiLM + dynamic gain modulation, `nn.remat`-checkpointed dilated causal residual blocks (`width=64, num_blocks=13`), a causal resting-silence AC fluctuation gate (`zero_resting_gate`, suppressing zero-input resting drift to `-199.2 dB SPL`), and an exact $O(\log T)$ modal `complex64` `jax.lax.associative_scan` 4th-order `20 Hz` Butterworth output high-pass (`vocoder_losses.causal_highpass`). Also implements [`arcfac`](https://github.com/Australian-Future-Hearing-Initiative/arcfac)'s baseline causal `tcn` (`229,569` params) for direct ablation.
+   - Trained end-to-end on TPU (`batch_size=64` via `grad_accum_steps=2` and multi-step `jax.lax.scan`) across streaming LibriSpeech `train-clean-100` (`ProcessedClips` via Grain) + Stage-2 1D Multi-Period + Multi-Resolution STFT (`MPD` + `MRD`) adversarial fine-tuning (`--gan_steps`) using randomized healthy/flat/sloping ears (`ears="mixture"` `0.25/0.35/0.40`, `mask=8000` / `0.25 s`, `warmup_weight=0.01`, healthy-only `lam=0.01` and MR-STFT `stft_weight=0.1`, `lam_impaired=0.0`, plus `--relative_nap`, `--mel_weight`, `--lf_complex_weight`, and `--rms_env_weight` polish).
 5. **Clinical Audiology & Differentiable `HASQI`/`HASPI` Prescriptions ([`clinical.py`](src/carfac_inversion/clinical.py), [`perceptual_losses.py`](src/carfac_inversion/perceptual_losses.py), [`train_phase5.py`](src/carfac_inversion/scripts/train_phase5.py), [`benchmark_phase5.py`](src/carfac_inversion/scripts/benchmark_phase5.py))**:
    - **Phase 5 (`cochlea_clinical_32k_v1`)** integrates standard clinical audiograms (`Bisgaard` `N1–N4` flat/moderately sloping, `S1–S3` steeply sloping, plus continuous `ISO 7029` age/sex/percentile audiograms), audiogram-to-CARFAC OHC/conductive mapping, and fully differentiable JAX `HASQI v2` / `HASPI v2` perceptual losses alongside cochlear manifold preservation.
    - Fits inverse hearing-aid prescriptions (`prescribe_audio_direct`) conditioning causal `CochleaDirectInverter` (`max_log_gain=4.5`) directly on the listener's 6-band audiogram so aided speech restores normal cochlear firing (`nap_healed_pct > 0`) while lifting severe-loss `HASPI`/`HASQI` beyond `NAL-R`.
-6. **Direct Generative `SAI → Audio` Synthesizer ([`sai_inverter.py`](src/carfac_inversion/sai_inverter.py), [`train_sai.py`](src/carfac_inversion/scripts/train_sai.py))**:
+6. **Direct Generative & Causal Strobe `SAI → Audio` Synthesizers ([`sai_inverter.py`](src/carfac_inversion/sai_inverter.py), [`train_sai.py`](src/carfac_inversion/scripts/train_sai.py))**:
    - **Phase 5b (`SaiDirectInverter`, `5,262,403` params)** directly inverts phase-discarding 3D CARFAC Stabilized Auditory Images (`(B, F, lags, C)`, `hop = 682` / `21.3 ms` at `32 kHz`) to `32 kHz` waveforms in a single feedforward pass (`0.08 s` warm per `2.0 s` clip — **`>10,000x` faster** than iterative CPU SAI optimization).
    - Uses high-CF (`c < 50*C//77`) per-channel-normalized harmonic-summed SACF pitch/voicing extraction (eliminating low-CF F1 ringing subharmonics and gradient-starving `cumsum` backprop via `_scale_grad` + chunked modular phase integration), multi-scale normalized lag projections + symmetric ConvNeXt decoder (`_SymmetricConvNeXt1D`), a DDSP `48`-harmonic sample-rate additive synthesizer, COLA `n_fft=1024, hop=128` STFT-filtered continuous white noise, physical lag-0 RMS envelope scaling, and multi-scale `lag-0` + `L2 sqrt-SAI` + `pool-8` + `MR-STFT` + Stage-2 1D MPD/MRD GAN training.
+   - **Causal Strobe-SAI → Audio (`causal_strobe_sai_to_nap`, `invert_strobe_sai_causal`, `--strobe_sai_input`)**: Decodes canonical 2-trigger `carfac.jax.sai` frames (`10 ms` OLA hop + `8 ms` causal `CochleaDirectInverter` = `18.0 ms` total algorithmic latency) via persistence-compensated exponential dereverberation and tonotopic cross-correlation in forward-only `jax.lax.scan`, fine-tuned end-to-end with `--strobe_sai_input` + 1D MPD/MRD GAN (`strobe_sai_direct` in `benchmark_arcfac.py`).
 
 ## Installation
 
@@ -255,9 +256,10 @@ python -m carfac_inversion.scripts.train_sai \
 python -m carfac_inversion.scripts.benchmark_arcfac \
   --input_dir=/path/to/wavs_or_shards \
   --output_dir=tmp/arcfac_benchmark \
-  --methods=phase4_direct,sai_direct,carfac_exact,arcfac_match_nap,arcfac_match_sai,arcfac_slaney \
-  --phase4_checkpoint=tmp/phase4_hybrid/checkpoint.npz \
-  --sai_checkpoint=tmp/phase5b_sai/checkpoint.npz
+  --methods=phase4_direct,sai_direct,strobe_sai_direct,carfac_exact,arcfac_match_nap,arcfac_match_sai,arcfac_slaney \
+  --phase4_checkpoint=tmp/phase4_hybrid/checkpoint_gan.npz \
+  --sai_checkpoint=tmp/phase5b_sai/checkpoint.npz \
+  --strobe_sai_checkpoint=tmp/phase4_strobe_sai/checkpoint_gan.npz
 ```
 
 ## Approach & Phased Evaluation Methodology
@@ -352,6 +354,17 @@ recorded with accepted/rejected ablations in
   inference on unseen LibriSpeech speech (`sai_rt_rel = 0.364`,
   `sai_kept = 0.033`, `sai_dir = 1.004` across `train-clean-100/test`).
   16-TPU (`vlp:4x4`) MLCR pathways support verified (`verify` + launcher default).
+- **Phase 4 `v3` Silence Gate, Relative NAP Polish, & `18 ms` Causal Strobe-SAI**:
+  Added `zero_resting_gate` (eliminating resting zero-input leakage down to
+  `-199.2 dB SPL`), `--relative_nap` / `--mel_weight` / `--lf_complex_weight` /
+  `--rms_env_weight` losses (`tc100_gan_v3` maintaining `+24.28 dB` SI-SDR /
+  `0.950` HASQI / `0.032` `log_stft` on `5`-clip `dev-clean/test`), and a
+  strictly causal `18.0 ms` 2-trigger strobe-SAI pipeline (`causal_strobe_sai_to_nap` +
+  `--strobe_sai_input` fine-tuned decoder `tc100_strobe_sai_v3`, evaluated via
+  `strobe_sai_direct` reaching `-174.7 dB SPL` silence floor, `log_stft = 0.160`,
+  and `HASQI = 0.348` across `5` unseen `dev-clean/test` clips). Adopted
+  organization-wide AFHI engineering conventions via `AGENTS.md`, `CLAUDE.md`,
+  and `.afhi/`.
 
 ## What the Metrics Mean
 
@@ -395,6 +408,8 @@ Trained on `8`-core `vlp:2x4` TPU (`~55.66 s` per 25-step scan chunk at `batch_s
 | `cochlea_hybrid` (`488.3k`, Step 500) | `dev-clean/test` (`2`) | `healthy` / `flat:0.5` | 0.162 | 0.152 | 0.208 | — / 1.007 | — | +15.18 dB | — | — |
 | `cochlea_hybrid` (`dev-clean` Step 2,000) | `dev-clean/test` (`5`) | `healthy` | 0.075 | 0.055 | — | — | 0.049 | +23.35 dB | 0.941 | `0.70–1.29 s` |
 | **`cochlea_hybrid` (`tc100_gan_v1`)** | `dev-clean/test` (`5`) | `healthy` | **0.071** | **0.048** | — | — | **0.032** | **+24.53 dB** | **0.954** | `0.56–1.13 s` |
+| **`cochlea_hybrid` (`tc100_gan_v3`, `-199.2 dB SPL` gate)** | `dev-clean/test` (`5`) | `healthy` | 0.072 | 0.052 | — | — | **0.032** | +24.28 dB | 0.950 | `1.28 s` (`0.7 s` warm) |
+| **`cochlea_hybrid` (`tc100_gan_v3`)** | `dev-clean/test` (`5`) | `flat:0.5` | 0.923 | 0.938 | **0.206** | **1.017 / 1.020** | 0.357 | -7.91 dB | 0.053 | `0.83 s` |
 | **`cochlea_hybrid` (`tc100_gan_v1`)** | `dev-clean/test` (`5`) | `flat:0.5` | 0.924 | 0.942 | **0.208** | **1.018 / 1.025** | 0.354 | -7.95 dB | 0.051 | `0.65 s` |
 | **`cochlea_hybrid` (`tc100_gan_v1`)** | `dev-clean/test` (`5`) | `sloping` | 0.898 | 0.701 | **0.184** | **0.957 / 0.909** | 0.322 | -7.67 dB | 0.224 | `0.66 s` |
 | **`cochlea_hybrid` (`tc100_gan_v1`)** | `train-clean-100/test` (`5`) | `healthy` | **0.071** | **0.046** | — | — | **0.042** | **+21.62 dB** | **0.929** | `1.20 s` |
@@ -454,6 +469,7 @@ Trained on `8`-core `vlp:2x4` TPU (`800` Stage-1 + `200` Stage-2 1D `MPD`/`MRD` 
 | `train-clean-100/test` (`5` clips × `2.0 s`, `65 dB`) | `flat:0.5` | 0.959 | **0.033** | **1.004** | 0.404 | 0.049 | `0.09 s` |
 | `train-clean-100/test` (`5` clips × `2.0 s`, `65 dB`) | `sloping` | 0.738 | 0.127 | 0.954 | 0.385 | 0.189 | `0.08 s` |
 | `dev-clean/test` (`5` clips × `2.0 s`, `30 / 50 / 65 / 80 / 95 dB`) | `healthy` | 0.453 / 0.409 / 0.390 / 0.351 / **0.330** | — | — | 0.184 / 0.172 / **0.164** / **0.164** / 0.199 | **0.576** / 0.521 / 0.472 / 0.419 / 0.322 | `0.08 s` |
+| `dev-clean/test` (`5` clips × `2.0 s`, `65 dB`, `strobe_sai_direct` `v3`, `18 ms` causal) | `healthy` / `flat:0.5` | 0.606 / 0.827 | — / 0.572 nap · 0.264 sai | — / 0.986 nap · 0.767 sai | **0.160** / **0.301** | 0.348 / 0.080 | `1.80–1.86 s` |
 | `real_speech_32k.wav` (`1.0 s`, `65 dB` vs. `arcfac_match_sai` `0.167–0.208` / `slaney` `0.858`) | `healthy` | 0.843 | — | — | **0.520** *(vs. `0.575–2.528`)* | 0.178 *(>5x `slaney` `0.033`)* | `0.07 s` (`2.13 s` cold) |
 | `real_speech_32k.wav` (`1.0 s`, `65 dB`) | `flat:0.5` | 0.982 | **0.049** | 1.052 | **0.586** *(vs. `0.700–2.476`)* | 0.035 | `0.07 s` |
 
@@ -521,9 +537,11 @@ Highlights on canonical out-of-domain `carfac/test_data` (`binaural_test.wav` & 
     - **Phase 3b Hybrid (`0+15`, `16.49 s`)**: `NAP 0.8755 | Env 0.9613 | SAI 0.9425 | STOI 0.8321 | HASPI 0.8856 | HASQI 0.160` (`3.4x` faster than `20+60`)
   - **Canonical `carfac/test_data` (`8` clips)**: `Phase 3b 0+15` (`15.37 s`) reaches `NAP 0.7981 | Env 0.9292 | SAI 0.9348 | HASPI 0.9379 | HASQI 0.201`, vs. Phase 2 `20+60` (`54.75 s`: `0.8127 / 0.9428 / 0.9425`) and `45+135` (`~120 s`: `0.8159 / 0.9464 / 0.9437`). Pass `target_mode="perceptual"` checkpoints (e.g. `phase3b_perceptual.npz`) via `--perceptual_neural_checkpoint` in `benchmark_suite.py` or `--neural_checkpoint` in `invert_nap.py --mode=perceptual`; using an `"exact"` checkpoint in `mode="perceptual"` now logs a clear mismatch warning.
 
-See [`docs/evaluation_phases.md`](docs/evaluation_phases.md) for the complete Phase 0–3b ablation log, accepted/rejected hypotheses, training details, and per-clip tables (**73 / 73** pytest tests passing across `inversion_test.py` (18), `neural_test.py` (8), `benchmark_suite_test.py` (6), `nap_inverter_test.py` (5), `tpu_test.py` (5), `vocoder_losses_test.py` (5), `clinical_test.py` (4), `invert_nap_test.py` (4), `perceptual_losses_test.py` (4), `arcfac_metrics_test.py` (3), `benchmark_arcfac_test.py` (3), `sai_inverter_test.py` (3), `train_phase4_test.py` (2), `benchmark_phase5_test.py` (1), `train_phase5_test.py` (1), and `train_sai_test.py` (1)).
+See [`docs/evaluation_phases.md`](docs/evaluation_phases.md) for the complete Phase 0–3b ablation log, accepted/rejected hypotheses, training details, and per-clip tables (**81 / 81** pytest tests passing across `inversion_test.py` (18), `neural_test.py` (8), `nap_inverter_test.py` (7), `benchmark_suite_test.py` (6), `vocoder_losses_test.py` (6), `sai_inverter_test.py` (5), `tpu_test.py` (5), `clinical_test.py` (4), `perceptual_losses_test.py` (4), `benchmark_arcfac_test.py` (4), `invert_nap_test.py` (4), `train_phase4_test.py` (4), `arcfac_metrics_test.py` (3), `benchmark_phase5_test.py` (1), `train_phase5_test.py` (1), and `train_sai_test.py` (1)).
 
 ## Development
+
+Follows AFHI conventions configured in [`AGENTS.md`](AGENTS.md), [`CLAUDE.md`](CLAUDE.md), and [`.afhi/`](.afhi/index.md):
 
 ```bash
 ruff format --check .

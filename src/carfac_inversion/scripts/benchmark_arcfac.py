@@ -56,6 +56,7 @@ _NEURAL_CHECKPOINT: flags.FlagHolder[str | None]
 _PERCEPTUAL_NEURAL_CHECKPOINT: flags.FlagHolder[str | None]
 _PHASE4_CHECKPOINT: flags.FlagHolder[str | None]
 _SAI_CHECKPOINT: flags.FlagHolder[str | None]
+_STROBE_SAI_CHECKPOINT: flags.FlagHolder[str | None]
 _SEED: flags.FlagHolder[int]
 
 
@@ -84,6 +85,7 @@ def define_flags(flag_values: flags.FlagValues = FLAGS) -> None:
   global _PERCEPTUAL_NEURAL_CHECKPOINT
   global _PHASE4_CHECKPOINT
   global _SAI_CHECKPOINT
+  global _STROBE_SAI_CHECKPOINT
   global _SEED
 
   _INPUT_DIR = flags.DEFINE_string(
@@ -224,6 +226,12 @@ def define_flags(flag_values: flags.FlagValues = FLAGS) -> None:
     "Optional Phase 5b direct SAI-to-audio inverter checkpoint (.npz) path.",
     flag_values=flag_values,
   )
+  _STROBE_SAI_CHECKPOINT = flags.DEFINE_string(
+    "strobe_sai_checkpoint",
+    None,
+    "Optional causal strobe-SAI NAP decoder checkpoint (.npz) path.",
+    flag_values=flag_values,
+  )
   _SEED = flags.DEFINE_integer("seed", 0, "PRNG seed.", flag_values=flag_values)
 
 
@@ -310,6 +318,7 @@ def _run_method(
   perceptual_neural_checkpoint: str | None,
   phase4_checkpoint: str | None,
   sai_checkpoint: str | None,
+  strobe_sai_checkpoint: str | None,
   arcfac_mods: tuple[Any, Any, Any] | None,
   arcfac_steps: int,
   arcfac_start: str,
@@ -360,6 +369,23 @@ def _run_method(
     wav = sai_inverter.invert_sai_direct(
       target_sai[0],
       sai_checkpoint,
+      target_samples=len(sig),
+    )
+    return wav, time.perf_counter() - t0
+
+  if method == "strobe_sai_direct":
+    if not strobe_sai_checkpoint:
+      raise ValueError(
+        "Method 'strobe_sai_direct' requires --strobe_sai_checkpoint=<path>."
+      )
+    s_st = sai_inverter.strobe_sai_from_naps_f32(
+      target_nap[None], sample_rate_hz=float(sample_rate_hz)
+    )
+    t0 = time.perf_counter()
+    wav = sai_inverter.invert_strobe_sai_causal(
+      s_st[0],
+      strobe_sai_checkpoint,
+      sample_rate_hz=float(sample_rate_hz),
       target_samples=len(sig),
     )
     return wav, time.perf_counter() - t0
@@ -490,6 +516,7 @@ def run_arcfac_benchmark(
   perceptual_neural_checkpoint: str | None = None,
   phase4_checkpoint: str | None = None,
   sai_checkpoint: str | None = None,
+  strobe_sai_checkpoint: str | None = None,
   seed: int = 0,
 ) -> list[dict[str, Any]]:
   """Runs head-to-head comparison between ``carfac_inversion`` and ``arcfac``."""
@@ -560,6 +587,7 @@ def run_arcfac_benchmark(
           perceptual_neural_checkpoint=perceptual_neural_checkpoint,
           phase4_checkpoint=phase4_checkpoint,
           sai_checkpoint=sai_checkpoint,
+          strobe_sai_checkpoint=strobe_sai_checkpoint,
           arcfac_mods=arcfac_mods,
           arcfac_steps=arcfac_steps,
           arcfac_start=arcfac_start,
@@ -655,6 +683,7 @@ def main(argv: Sequence[str]) -> None:
     perceptual_neural_checkpoint=_PERCEPTUAL_NEURAL_CHECKPOINT.value,
     phase4_checkpoint=_PHASE4_CHECKPOINT.value,
     sai_checkpoint=_SAI_CHECKPOINT.value,
+    strobe_sai_checkpoint=_STROBE_SAI_CHECKPOINT.value,
     seed=_SEED.value,
   )
 

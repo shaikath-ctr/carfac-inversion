@@ -102,6 +102,66 @@ class SaiInverterTest(absltest.TestCase):
       )
       np.testing.assert_allclose(y_dir, y_ref, rtol=1e-5, atol=1e-5)
 
+  def test_strobe_sai_and_causal_ola_frame_causality(self):
+    rng = np.random.default_rng(23)
+    naps = np.maximum(
+      0.0, rng.normal(0.05, 0.05, size=(1, 6400, 8)).astype(np.float32)
+    )
+    sai = sai_inverter.strobe_sai_from_naps_f32(naps, sample_rate_hz=16000.0)
+    self.assertEqual(sai.ndim, 4)
+    self.assertEqual(sai.shape[0], 1)
+    self.assertEqual(sai.shape[3], 8)
+
+    est_a = np.asarray(
+      sai_inverter.causal_strobe_sai_to_nap(
+        sai, sample_rate_hz=16000.0, target_samples=6400
+      )
+    )
+    self.assertEqual(est_a.shape, (1, 6400, 8))
+    self.assertTrue(np.all(np.isfinite(est_a)))
+
+    # Perturbing frames >= 12 must leave earlier causal samples untouched.
+    hop = sai_inverter.default_strobe_sai_params(16000.0, 8)[
+      "input_segment_width"
+    ]
+    max_shift = max(8, hop // 2)
+    sai_b = sai.at[:, 12:, :, :].set(sai[:, 12:, :, :] + 0.5)
+    est_b = np.asarray(
+      sai_inverter.causal_strobe_sai_to_nap(
+        sai_b, sample_rate_hz=16000.0, target_samples=6400
+      )
+    )
+    cutoff = 12 * hop - max_shift
+    np.testing.assert_allclose(
+      est_a[:, :cutoff, :], est_b[:, :cutoff, :], atol=0.0
+    )
+
+    # Explicit fixed decay preserves backward compatibility and shape.
+    est_fixed = np.asarray(
+      sai_inverter.causal_strobe_sai_to_nap(
+        sai, sample_rate_hz=16000.0, target_samples=6400, persistence_decay=0.45
+      )
+    )
+    self.assertEqual(est_fixed.shape, est_a.shape)
+    self.assertTrue(np.all(np.isfinite(est_fixed)))
+
+  def test_build_strobe_sai_extractor_and_nap_fn_jit_parity(self):
+    rng = np.random.default_rng(31)
+    naps = np.maximum(
+      0.0, rng.normal(0.05, 0.05, size=(2, 3200, 8)).astype(np.float32)
+    )
+    ref_sai = np.asarray(
+      sai_inverter.strobe_sai_from_naps_f32(naps, sample_rate_hz=16000.0)
+    )
+    ext_fn = jax.jit(sai_inverter.build_strobe_sai_extractor(16000.0, 8))
+    got_sai = np.asarray(ext_fn(jnp.asarray(naps, dtype=jnp.float32)))
+    np.testing.assert_allclose(got_sai, ref_sai, rtol=1e-5, atol=1e-5)
+
+    nap_fn = jax.jit(sai_inverter.build_causal_strobe_sai_nap_fn(16000.0, 8))
+    est_nap = np.asarray(nap_fn(jnp.asarray(naps, dtype=jnp.float32)))
+    self.assertEqual(est_nap.shape, naps.shape)
+    self.assertTrue(np.all(np.isfinite(est_nap)))
+
 
 if __name__ == "__main__":
   absltest.main()

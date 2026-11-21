@@ -11,9 +11,11 @@ STFT-filtered white-noise branch.
 
 import dataclasses
 import functools
+import importlib
 import json
 import math
 import pathlib
+from collections.abc import Callable
 from collections.abc import Mapping
 from typing import Any
 from typing import cast
@@ -25,6 +27,8 @@ import numpy as np
 from flax import traverse_util
 from hp_acoustic.models import sai as sai_lib
 
+from carfac_inversion import nap_inverter
+from carfac_inversion import tpu
 from carfac_inversion import vocoder_losses
 
 DEFAULT_SAI_HYPERS = sai_lib.SaiHypers()
@@ -613,3 +617,432 @@ def invert_sai_direct(
     dtype=np.float32,
   )
   return y[0] if unbatched else y
+
+
+def default_strobe_sai_params(
+  sample_rate_hz: float = 32000.0,
+  num_channels: int = 77,
+) -> dict[str, int]:
+  """Returns canonical CARFAC strobe-SAI parameters for ``sample_rate_hz``."""
+  hop = max(1, int(round(0.01 * float(sample_rate_hz))))
+  sai_width = max(hop + 2, int(round(0.025 * float(sample_rate_hz))))
+  return {
+    "num_channels": int(num_channels),
+    "sai_width": sai_width,
+    "future_lags": sai_width // 2 - 1,
+    "num_triggers_per_frame": 2,
+    "trigger_window_width": max(sai_width + 1, 2 * hop),
+    "input_segment_width": hop,
+    "num_ears": 1,
+  }
+
+
+def _strobe_padding(
+  n_samples: int,
+  p_dict: Mapping[str, int],
+) -> tuple[int, int, int, int]:
+  """Returns ``(n_frames, lead_frames, pre_pad, post_pad)`` for strobe SAI."""
+  hop = int(p_dict["input_segment_width"])
+  n_frames = max(1, math.ceil(n_samples / hop))
+  delay = (
+    int(p_dict["future_lags"])
+    + max(0, int(p_dict["trigger_window_width"]) - hop) // 2
+  )
+  lead = math.ceil(delay / hop)
+  pre = lead * hop - delay
+  post = (n_frames + lead) * hop - pre - n_samples
+  return n_frames, lead, pre, post
+
+
+def _strobe_trigger_window_f32(trigger_window_width: int) -> np.ndarray:
+  """Builds CARFAC sine trigger window matching ``carfac.jax.sai.design_sai``."""
+  n = int(trigger_window_width)
+  start = math.pi / n
+  step = (math.pi - start) / max(n - 1, 1)
+  win = [math.sin(start + i * step) for i in range(n - 1)]
+  win.append(math.sin(math.pi))
+  return np.asarray(win, dtype=np.float32)
+
+
+def _run_strobe_sai_pure_jax(
+  padded_naps: jnp.ndarray,
+  p_dict: Mapping[str, int],
+  trigger_window: jnp.ndarray,
+) -> jnp.ndarray:
+  """Pure-JAX ``jax.lax.scan`` implementation of monaural CARFAC strobe SAI."""
+  batch, total_samples, n_ch = padded_naps.shape
+  hop = int(p_dict["input_segment_width"])
+  sai_w = int(p_dict["sai_width"])
+  future_lags = int(p_dict["future_lags"])
+  n_trig = int(p_dict["num_triggers_per_frame"])
+  tw = int(p_dict["trigger_window_width"])
+  buf_w = sai_w + int((1.0 + float(n_trig - 1) / 2.0) * tw)
+  win_hop = tw // 2
+  win_start = (buf_w - tw) - (n_trig - 1) * win_hop
+  win_range_start = win_start - future_lags
+  offset_range_start = 1 + win_start - sai_w
+
+  fallback_idx = jnp.argmax(trigger_window)
+  fallback_val = trigger_window[fallback_idx]
+  n_tot = total_samples // hop
+  segments = jnp.transpose(
+    padded_naps.reshape((batch, n_tot, hop, n_ch)), (1, 0, 3, 2)
+  )
+
+  def _stabilize_ch(ch_in: jax.Array, ch_out: jax.Array) -> jax.Array:
+    out = ch_out
+    for w_idx in range(n_trig):
+      off = w_idx * win_hop
+      start = win_range_start + off
+      windowed = ch_in[start : start + tw] * trigger_window
+      p_idx = jnp.argmax(windowed)
+      p_val = windowed[p_idx]
+      use_fb = p_val <= 0.0
+      trig_t = jnp.where(use_fb, fallback_idx, p_idx) + off
+      p_eff = jnp.where(use_fb, fallback_val, p_val)
+      alpha = (0.025 + p_eff) / (0.5 + p_eff)
+      aligned = jax.lax.dynamic_slice_in_dim(
+        ch_in, trig_t + offset_range_start, sai_w
+      )
+      out = (1.0 - alpha) * out + alpha * aligned
+    return out
+
+  def _scan_step(
+    carry: tuple[jax.Array, jax.Array], seg: jax.Array
+  ) -> tuple[tuple[jax.Array, jax.Array], jax.Array]:
+    prev_in, prev_out = carry
+    in_buf = jnp.concatenate([prev_in[..., hop:], seg], axis=-1)
+    out_buf = jax.vmap(jax.vmap(_stabilize_ch))(in_buf, prev_out)
+    return (in_buf, out_buf), out_buf
+
+  init_state = (
+    jnp.zeros((batch, n_ch, buf_w), dtype=jnp.float32),
+    jnp.zeros((batch, n_ch, sai_w), dtype=jnp.float32),
+  )
+  _, frames = jax.lax.scan(_scan_step, init_state, segments)
+  return jnp.transpose(frames, (1, 0, 3, 2))
+
+
+def build_strobe_sai_extractor(
+  sample_rate_hz: float = 32000.0,
+  num_channels: int = 77,
+  mesh: jax.sharding.Mesh | None = None,
+) -> Callable[[jnp.ndarray], jnp.ndarray]:
+  """Builds a JIT-safe strobe-SAI extractor ``naps -> sai (B, F, W, C)``.
+
+  Args:
+    sample_rate_hz: Sample rate in Hz matching the NAP sequence.
+    num_channels: Cochlear channel count ``C``.
+    mesh: Optional TPU/device mesh onto which static window weights are replicated.
+
+  Returns:
+    Pure JAX callable safe inside ``@jax.jit`` and ``jax.lax.scan``.
+  """
+  p_dict = default_strobe_sai_params(sample_rate_hz, num_channels)
+  try:
+    carfac_jax_sai = importlib.import_module("carfac.jax.sai")
+  except ImportError:
+    carfac_jax_sai = None
+
+  if carfac_jax_sai is not None and hasattr(carfac_jax_sai, "run_sai"):
+    sai_mod: Any = carfac_jax_sai
+    sai_p = sai_mod.SaiDesignParameters(**p_dict)
+    with tpu.host_cpu_context():
+      w_host = tpu.to_host_tree(sai_mod.design_sai(sai_p))
+    w_dev = (
+      tpu.replicate_tree(w_host, mesh)
+      if mesh is not None
+      else jax.tree.map(jnp.asarray, w_host)
+    )
+
+    def _extract_carfac_jax(naps: jnp.ndarray) -> jnp.ndarray:
+      naps_j = jnp.asarray(naps, dtype=jnp.float32)
+      n_samples = int(naps_j.shape[1])
+      n_frames, lead, pre, post = _strobe_padding(n_samples, p_dict)
+      padded = jnp.pad(naps_j, ((0, 0), (pre, post), (0, 0)))
+      raw = jax.vmap(
+        lambda n: sai_mod.run_sai(n[..., None], sai_p, w_dev)[0][:, 0]
+      )(padded)
+      return jnp.transpose(raw, (0, 1, 3, 2))[:, lead : lead + n_frames]
+
+    return _extract_carfac_jax
+
+  win_host = _strobe_trigger_window_f32(p_dict["trigger_window_width"])
+  win_dev = cast(
+    jnp.ndarray,
+    (
+      tpu.replicate_tree(win_host, mesh)
+      if mesh is not None
+      else jnp.asarray(win_host, dtype=jnp.float32)
+    ),
+  )
+
+  def _extract_pure_jax(naps: jnp.ndarray) -> jnp.ndarray:
+    naps_j = jnp.asarray(naps, dtype=jnp.float32)
+    n_samples = int(naps_j.shape[1])
+    n_frames, lead, pre, post = _strobe_padding(n_samples, p_dict)
+    padded = jnp.pad(naps_j, ((0, 0), (pre, post), (0, 0)))
+    return _run_strobe_sai_pure_jax(padded, p_dict, win_dev)[
+      :, lead : lead + n_frames
+    ]
+
+  return _extract_pure_jax
+
+
+def build_causal_strobe_sai_nap_fn(
+  sample_rate_hz: float = 32000.0,
+  num_channels: int = 77,
+  mesh: jax.sharding.Mesh | None = None,
+) -> Callable[[jnp.ndarray], jnp.ndarray]:
+  """Returns a JIT-safe transform mapping ``(B, T, C)`` NAPs through causal strobe SAI -> NAP.
+
+  Args:
+    sample_rate_hz: Sample rate in Hz matching the NAP sequence.
+    num_channels: Cochlear channel count ``C``.
+    mesh: Optional TPU/device mesh for replicating static SAI window weights.
+
+  Returns:
+    Pure JAX callable mapping target NAPs to causal strobe-SAI reconstructed NAPs
+    of identical shape ``(B, T, C)``.
+  """
+  extractor = build_strobe_sai_extractor(
+    sample_rate_hz=sample_rate_hz,
+    num_channels=num_channels,
+    mesh=mesh,
+  )
+
+  def _strobe_nap_fn(naps: jnp.ndarray) -> jnp.ndarray:
+    sais = extractor(naps)
+    return causal_strobe_sai_to_nap(
+      sais,
+      sample_rate_hz=sample_rate_hz,
+      target_samples=int(naps.shape[1]),
+    )
+
+  return _strobe_nap_fn
+
+
+def strobe_sai_from_naps_f32(
+  naps: jnp.ndarray | np.ndarray,
+  sample_rate_hz: float = 32000.0,
+) -> jnp.ndarray:
+  """Computes canonical strobe-triggered CARFAC SAIs ``(B, F, W, C)``.
+
+  Uses ``carfac.jax.sai`` on JAX/TPU backends when available, falling back to
+  ``carfac.sai.SAI`` when an older ``carfac`` wheel is installed.
+  """
+  naps_j = jnp.asarray(naps, dtype=jnp.float32)
+  if naps_j.ndim != 3:
+    raise ValueError(
+      f"Expected naps of shape (batch, samples, channels), got {naps_j.shape}."
+    )
+  batch, n_samples, n_ch = naps_j.shape
+  p_dict = default_strobe_sai_params(sample_rate_hz, n_ch)
+  hop = p_dict["input_segment_width"]
+  n_frames, lead, pre, post = _strobe_padding(n_samples, p_dict)
+  padded = jnp.pad(naps_j, ((0, 0), (pre, post), (0, 0)))
+
+  try:
+    carfac_jax_sai = importlib.import_module("carfac.jax.sai")
+  except ImportError:
+    carfac_jax_sai = None
+
+  if carfac_jax_sai is not None and hasattr(carfac_jax_sai, "run_sai"):
+    with tpu.host_cpu_context():
+      sai_p = carfac_jax_sai.SaiDesignParameters(**p_dict)
+      weights = carfac_jax_sai.design_sai(sai_p)
+    weights_dev = jax.device_put(weights, naps_j.device)
+    raw = jax.vmap(
+      lambda n: carfac_jax_sai.run_sai(n[..., None], sai_p, weights_dev)[0][
+        :, 0
+      ]
+    )(padded)
+    return jnp.transpose(raw, (0, 1, 3, 2))[:, lead : lead + n_frames]
+
+  carfac_np_sai = importlib.import_module("carfac.sai")
+  sai_p_np = carfac_np_sai.SAIParams(**p_dict)
+  padded_np = np.asarray(padded, dtype=np.float32)
+  total_frames = padded_np.shape[1] // hop
+  out = np.zeros((batch, n_frames, p_dict["sai_width"], n_ch), dtype=np.float32)
+  for b_idx in range(batch):
+    sai_obj = carfac_np_sai.SAI(sai_p_np)
+    frames_b = np.zeros(
+      (total_frames, p_dict["sai_width"], n_ch), dtype=np.float32
+    )
+    for f_idx in range(total_frames):
+      seg = padded_np[b_idx, f_idx * hop : (f_idx + 1) * hop, :].T
+      frames_b[f_idx] = sai_obj.RunSegment(seg).T
+    out[b_idx] = frames_b[lead : lead + n_frames]
+  return jnp.asarray(out, dtype=jnp.float32)
+
+
+def causal_strobe_sai_to_nap(
+  sai: jnp.ndarray,
+  *,
+  sample_rate_hz: float = 32000.0,
+  target_samples: int | None = None,
+  persistence_decay: float | None = None,
+) -> jnp.ndarray:
+  """Strictly causal single-frame OLA estimator from strobe SAI to NAP.
+
+  Recovers sample-level ``(B, T, C)`` NAPs in a forward-only ``jax.lax.scan``
+  over frames ``0..F-1`` using CARFAC's 2-trigger exponential persistence law
+  and scale-invariant tonotopic cross-correlation without accessing future
+  frames (algorithmic latency of one 10 ms SAI frame).
+  """
+  sai_j = jnp.asarray(sai, dtype=jnp.float32)
+  if sai_j.ndim != 4:
+    raise ValueError(
+      f"Expected strobe sai of shape (batch, frames, width, ch), got {sai_j.shape}."
+    )
+  batch, n_frames, sai_width, n_ch = sai_j.shape
+  hop = max(1, int(round(0.01 * float(sample_rate_hz))))
+  max_shift = max(8, hop // 2)
+  l_buf = sai_width + 2 * max_shift
+  n_fft = 1 << int(math.ceil(math.log2(l_buf + sai_width)))
+  win = _hann_f32(sai_width)[None, :, None]
+  win_sq = win * win
+
+  # Future lag window around trigger zero-lag (middle index = sai_width // 2).
+  w0 = sai_width // 2
+  half_w = max(2, sai_width // 200)
+  z_lo = max(0, w0 - half_w)
+  z_hi = min(sai_width, w0 + half_w + 1)
+
+  shifts = jnp.arange(-max_shift, max_shift + 1, dtype=jnp.float32)
+  lag_pen = jnp.float32(0.02) * ((shifts / float(max(1, max_shift))) ** 2)
+  lag_pen = lag_pen[None, :, None]
+
+  frames_t = jnp.swapaxes(sai_j, 0, 1)  # (F, B, W, C)
+  b_ax = jnp.arange(batch, dtype=jnp.int32)[:, None, None]
+  c_ax = jnp.arange(n_ch, dtype=jnp.int32)[None, None, :]
+  pos_ax = jnp.arange(l_buf, dtype=jnp.int32)[None, :, None]
+
+  def _scan_step(
+    carry: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
+    sai_f: jax.Array,
+  ) -> tuple[
+    tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array], jax.Array
+  ]:
+    step_idx, prev_sai, prev_alpha, buf_val, buf_w = carry
+    pos_f = jax.nn.relu(sai_f)
+    peak_f = jnp.max(pos_f[:, z_lo:z_hi, :], axis=1, keepdims=True)
+    alpha_f = jnp.clip(
+      (jnp.float32(0.025) + peak_f) / (0.5 + peak_f), 0.05, 1.0
+    )
+    if persistence_decay is None:
+      rem = (1.0 - prev_alpha) * (1.0 - alpha_f)
+      dep_f = jnp.where(
+        step_idx == 0,
+        pos_f,
+        jnp.clip(
+          (sai_f - rem * prev_sai) / jnp.maximum(1.0 - rem, 0.12),
+          0.0,
+          jnp.float32(1.5) * pos_f,
+        ),
+      )
+    else:
+      dep_f = jnp.where(
+        step_idx == 0,
+        pos_f,
+        jax.nn.relu(sai_f - jnp.float32(persistence_decay) * prev_sai),
+      )
+    cur_val = dep_f * win
+    cur_spec = jnp.conj(jnp.fft.rfft(cur_val, n=n_fft, axis=1))
+    buf_spec = jnp.fft.rfft(buf_val, n=n_fft, axis=1)
+    cc = jnp.fft.irfft(buf_spec * cur_spec, n=n_fft, axis=1)[
+      :, : 2 * max_shift + 1, :
+    ]
+    buf_norm = jnp.sqrt(
+      jnp.mean(buf_val * buf_val, axis=1, keepdims=True) + 1e-12
+    )
+    cur_norm = jnp.sqrt(
+      jnp.mean(cur_val * cur_val, axis=1, keepdims=True) + 1e-12
+    )
+    cc_n = cc / (jnp.float32(sai_width) * buf_norm * cur_norm + 1e-8)
+    c_left = jnp.concatenate([cc_n[:, :, :1], cc_n[:, :, :-1]], axis=-1)
+    c_right = jnp.concatenate([cc_n[:, :, 1:], cc_n[:, :, -1:]], axis=-1)
+    cc_local = (
+      jnp.float32(0.5) * cc_n
+      + jnp.float32(0.25) * c_left
+      + jnp.float32(0.25) * c_right
+    )
+    score = (
+      cc_local
+      + jnp.float32(0.20) * jnp.mean(cc_n, axis=-1, keepdims=True)
+      - lag_pen
+    )
+    best_k = jnp.argmax(score, axis=1)
+    shift_k = jnp.where(step_idx == 0, max_shift, best_k)[:, None, :]
+
+    raw_idx = pos_ax - shift_k
+    valid = (raw_idx >= 0) & (raw_idx < sai_width)
+    safe_idx = jnp.clip(raw_idx, 0, sai_width - 1)
+    add_val = jnp.where(valid, cur_val[b_ax, safe_idx, c_ax], 0.0)
+    add_w = jnp.where(valid, win_sq[0, safe_idx, 0], 0.0)
+
+    comb_val = buf_val + add_val
+    comb_w = buf_w + add_w
+    emit = comb_val[:, :hop, :] / jnp.maximum(comb_w[:, :hop, :], 1e-6)
+    next_val = jnp.pad(comb_val[:, hop:, :], ((0, 0), (0, hop), (0, 0)))
+    next_w = jnp.pad(comb_w[:, hop:, :], ((0, 0), (0, hop), (0, 0)))
+    return (step_idx + 1, sai_f, alpha_f, next_val, next_w), emit
+
+  init_carry = (
+    jnp.asarray(0, dtype=jnp.int32),
+    jnp.zeros((batch, sai_width, n_ch), dtype=jnp.float32),
+    jnp.ones((batch, 1, n_ch), dtype=jnp.float32),
+    jnp.zeros((batch, l_buf, n_ch), dtype=jnp.float32),
+    jnp.zeros((batch, l_buf, n_ch), dtype=jnp.float32),
+  )
+  (_, _, _, tail_val, tail_w), emitted = jax.lax.scan(
+    _scan_step, init_carry, frames_t
+  )
+  main_nap = jnp.swapaxes(emitted, 0, 1).reshape((batch, n_frames * hop, n_ch))
+  tail_nap = tail_val / jnp.maximum(tail_w, 1e-6)
+  full_nap = jnp.concatenate([main_nap, tail_nap], axis=1)[:, max_shift:, :]
+  t_out = int(target_samples) if target_samples is not None else n_frames * hop
+  if full_nap.shape[1] < t_out:
+    full_nap = jnp.pad(
+      full_nap, ((0, 0), (0, t_out - full_nap.shape[1]), (0, 0))
+    )
+  return full_nap[:, :t_out, :]
+
+
+def invert_strobe_sai_causal(
+  target_sai: np.ndarray | jnp.ndarray,
+  nap_checkpoint_path: str | pathlib.Path,
+  *,
+  sample_rate_hz: float = 32000.0,
+  target_samples: int | None = None,
+) -> np.ndarray:
+  """Causally reconstructs audio from strobe-triggered CARFAC SAI via NAP."""
+  sai_np = np.asarray(target_sai, dtype=np.float32)
+  unbatched = sai_np.ndim == 3
+  sai_4d = sai_np[None, :, :, :] if unbatched else sai_np
+  if sai_4d.ndim != 4:
+    raise ValueError(f"target_sai must be 3D or 4D, got shape {sai_np.shape}.")
+  est_nap = np.asarray(
+    jax.jit(
+      lambda s: causal_strobe_sai_to_nap(
+        s, sample_rate_hz=sample_rate_hz, target_samples=target_samples
+      )
+    )(jnp.asarray(sai_4d, dtype=jnp.float32)),
+    dtype=np.float32,
+  )
+  model, params, cfg = nap_inverter.load_direct_checkpoint(nap_checkpoint_path)
+  if abs(float(sample_rate_hz) - float(cfg.fs)) > 1.0:
+    raise ValueError(
+      f"Strobe SAI rate {sample_rate_hz} Hz != NAP checkpoint rate {cfg.fs} Hz."
+    )
+  out = np.stack(
+    [
+      nap_inverter.invert_nap_direct(
+        est_nap[i], nap_checkpoint_path, align_lookahead=True
+      )
+      for i in range(est_nap.shape[0])
+    ],
+    axis=0,
+  )
+  del model, params
+  return out[0] if unbatched else out

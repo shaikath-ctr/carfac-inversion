@@ -187,6 +187,107 @@ class VocoderLossesTest(absltest.TestCase):
     self.assertGreater(float(m_healthy["stft"]), 0.0)
     self.assertGreater(float(m_healthy["nap_l1"]), 0.0)
 
+    # Relative NAP scaling & zero nap_weight skips cochlea forward pass.
+    _, m_rel = vocoder_losses.compute_arcfac_inverter_loss(
+      y,
+      x,
+      tgt_nap,
+      fake_ear,
+      lookahead=64,
+      mask_samples=512,
+      output_scale=0.05,
+      relative_nap=True,
+    )
+    self.assertGreater(float(m_rel["loss"]), float(m_rel["nap_l1"]))
+
+    def _forbidden_ear(w: jnp.ndarray) -> jnp.ndarray:
+      raise AssertionError(
+        f"healthy_ear_fn must not be invoked when nap/sai weights are 0 (got {w.shape})"
+      )
+
+    loss_no_coch, m_no_coch = vocoder_losses.compute_arcfac_inverter_loss(
+      y,
+      x,
+      tgt_nap,
+      _forbidden_ear,
+      lookahead=64,
+      mask_samples=512,
+      output_scale=0.05,
+      nap_weight=0.0,
+      sai_weight=0.0,
+      mel_weight=1.0,
+      apply_mel=True,
+      lf_complex_weight=0.5,
+      apply_lf_complex=True,
+      rms_env_weight=0.5,
+      apply_rms_env=True,
+      sample_rate_hz=16000.0,
+    )
+    self.assertTrue(np.isfinite(float(loss_no_coch)))
+    self.assertEqual(float(m_no_coch["nap_l1"]), 0.0)
+    self.assertGreater(float(m_no_coch["mel"]), 0.0)
+    self.assertGreater(float(m_no_coch["lf_complex"]), 0.0)
+    self.assertGreater(float(m_no_coch["rms_env"]), 0.0)
+
+  def test_phase_tolerant_spectral_and_rms_helpers(self):
+    fs = 16000.0
+    t = np.arange(4096, dtype=np.float32) / fs
+    x = jnp.asarray(
+      np.stack(
+        [
+          0.08 * np.sin(2.0 * np.pi * 220.0 * t),
+          0.05 * np.sin(2.0 * np.pi * 440.0 * t),
+        ]
+      ),
+      dtype=jnp.float32,
+    )
+    y = jnp.asarray(
+      np.stack(
+        [
+          0.08 * np.sin(2.0 * np.pi * 440.0 * t + 0.5),
+          0.02 * np.sin(2.0 * np.pi * 440.0 * t),
+        ]
+      ),
+      dtype=jnp.float32,
+    )
+    self.assertLess(
+      float(
+        jnp.max(vocoder_losses.multi_scale_mel_loss(x, x, sample_rate_hz=fs))
+      ),
+      1e-5,
+    )
+    self.assertGreater(
+      float(
+        jnp.min(vocoder_losses.multi_scale_mel_loss(y, x, sample_rate_hz=fs))
+      ),
+      0.05,
+    )
+    self.assertLess(
+      float(
+        jnp.max(
+          vocoder_losses.low_freq_complex_stft_loss(x, x, sample_rate_hz=fs)
+        )
+      ),
+      1e-3,
+    )
+    self.assertGreater(
+      float(
+        jnp.min(
+          vocoder_losses.low_freq_complex_stft_loss(y, x, sample_rate_hz=fs)
+        )
+      ),
+      0.1,
+    )
+    self.assertLess(
+      float(
+        jnp.max(vocoder_losses.multiscale_log_rms_loss(x, x, sample_rate_hz=fs))
+      ),
+      1e-5,
+    )
+    rms_losses = vocoder_losses.multiscale_log_rms_loss(y, x, sample_rate_hz=fs)
+    self.assertLess(float(rms_losses[0]), 0.01)
+    self.assertGreater(float(rms_losses[1]), 0.5)
+
 
 if __name__ == "__main__":
   absltest.main()

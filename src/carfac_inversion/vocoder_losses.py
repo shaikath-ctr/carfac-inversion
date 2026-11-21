@@ -7,6 +7,7 @@ UnivNet discriminators for direct NAP-to-audio and perceptual auralization
 training.
 """
 
+import functools
 from collections.abc import Callable
 from collections.abc import Sequence
 from typing import cast
@@ -137,14 +138,13 @@ def causal_highpass(
   return jnp.moveaxis(out, 0, -1)
 
 
-def stft_magnitude(
+def _framed_rfft(
   x: jnp.ndarray,
   n_fft: int,
   hop: int,
   win_length: int,
-  eps: float = 1e-7,
 ) -> jnp.ndarray:
-  """Computes STFT magnitude ``(batch, frames, n_fft // 2 + 1)``."""
+  """Computes reflection-padded complex Hann rFFT frames ``(batch, frames, bins)``."""
   if x.ndim != 2:
     raise ValueError(f"Expected (batch, samples), got shape {x.shape}.")
   if win_length > n_fft:
@@ -159,8 +159,136 @@ def stft_magnitude(
   window = 0.5 - 0.5 * jnp.cos(2.0 * jnp.pi * n / float(win_length))
   left = (n_fft - win_length) // 2
   window = jnp.pad(window, (left, n_fft - win_length - left))
-  spec = jnp.fft.rfft(x_pad[:, idx] * window[None, None, :], axis=-1)
+  return jnp.fft.rfft(x_pad[:, idx] * window[None, None, :], axis=-1)
+
+
+def stft_magnitude(
+  x: jnp.ndarray,
+  n_fft: int,
+  hop: int,
+  win_length: int,
+  eps: float = 1e-7,
+) -> jnp.ndarray:
+  """Computes STFT magnitude ``(batch, frames, n_fft // 2 + 1)``."""
+  spec = _framed_rfft(x, n_fft, hop, win_length)
   return jnp.sqrt(jnp.real(spec) ** 2 + jnp.imag(spec) ** 2 + eps)
+
+
+@functools.lru_cache(maxsize=16)
+def _mel_filterbank_np(
+  sample_rate_hz: float,
+  n_fft: int,
+  n_mels: int,
+) -> np.ndarray:
+  """Builds an area-normalized triangular mel filterbank ``(bins, n_mels)``."""
+  hi_hz = 0.5 * float(sample_rate_hz)
+  hi_mel = 2595.0 * np.log10(1.0 + hi_hz / 700.0)
+  mels = np.linspace(0.0, hi_mel, n_mels + 2)
+  hz = 700.0 * (10.0 ** (mels / 2595.0) - 1.0)
+  freqs = np.fft.rfftfreq(n_fft, d=1.0 / float(sample_rate_hz))
+  fb = np.zeros((freqs.shape[0], n_mels), dtype=np.float32)
+  for m in range(n_mels):
+    f0, f1, f2 = hz[m], hz[m + 1], hz[m + 2]
+    tri = np.maximum(
+      0.0,
+      np.minimum(
+        (freqs - f0) / max(f1 - f0, 1e-8),
+        (f2 - freqs) / max(f2 - f1, 1e-8),
+      ),
+    )
+    denom = float(np.sum(tri))
+    fb[:, m] = (tri / denom if denom > 1e-8 else tri).astype(np.float32)
+  return fb
+
+
+def multi_scale_mel_loss(
+  y: jnp.ndarray,
+  x: jnp.ndarray,
+  *,
+  sample_rate_hz: float = 32000.0,
+  specs: Sequence[tuple[int, int, int]] = (
+    (512, 128, 64),
+    (1024, 256, 80),
+    (2048, 512, 128),
+  ),
+  eps: float = 1e-5,
+) -> jnp.ndarray:
+  """Computes per-clip multi-resolution log-mel L1 distance ``(batch,)``."""
+  if y.shape != x.shape:
+    raise ValueError(f"y {y.shape} and x {x.shape} differ in shape.")
+  valid = [s for s in specs if x.shape[1] > s[0] // 2]
+  if not valid:
+    valid = [(256, 64, 40)]
+  terms: list[jnp.ndarray] = []
+  for n_fft, hop, n_mels in valid:
+    mag_y = stft_magnitude(y, n_fft, hop, n_fft, eps=eps * eps)
+    mag_x = stft_magnitude(x, n_fft, hop, n_fft, eps=eps * eps)
+    fb = jnp.asarray(_mel_filterbank_np(float(sample_rate_hz), n_fft, n_mels))
+    mel_y = jnp.matmul(mag_y, fb)
+    mel_x = jnp.matmul(mag_x, fb)
+    terms.append(
+      jnp.mean(
+        jnp.abs(jnp.log(mel_y + eps) - jnp.log(mel_x + eps)), axis=(1, 2)
+      )
+    )
+  return jnp.mean(jnp.stack(terms, axis=0), axis=0)
+
+
+def low_freq_complex_stft_loss(
+  y: jnp.ndarray,
+  x: jnp.ndarray,
+  *,
+  sample_rate_hz: float = 32000.0,
+  cutoff_hz: float = 900.0,
+  specs: Sequence[tuple[int, int]] = ((1024, 256), (2048, 512)),
+  eps: float = 1e-5,
+) -> jnp.ndarray:
+  """Computes per-clip relative complex STFT L2 error below ``cutoff_hz``."""
+  if y.shape != x.shape:
+    raise ValueError(f"y {y.shape} and x {x.shape} differ in shape.")
+  valid = [s for s in specs if x.shape[1] > s[0] // 2]
+  if not valid:
+    valid = [(256, 64)]
+  terms: list[jnp.ndarray] = []
+  for n_fft, hop in valid:
+    freqs = np.fft.rfftfreq(n_fft, d=1.0 / float(sample_rate_hz))
+    k_max = max(2, int(np.searchsorted(freqs, cutoff_hz, side="right")))
+    zy = _framed_rfft(y, n_fft, hop, n_fft)[:, :, :k_max]
+    zx = _framed_rfft(x, n_fft, hop, n_fft)[:, :, :k_max]
+    diff_sq = jnp.square(zy.real - zx.real) + jnp.square(zy.imag - zx.imag)
+    ref_sq = jnp.square(zx.real) + jnp.square(zx.imag)
+    err = jnp.sqrt(jnp.mean(diff_sq, axis=(1, 2)) + 1e-12)
+    ref = jnp.maximum(jnp.sqrt(jnp.mean(ref_sq, axis=(1, 2)) + 1e-12), eps)
+    terms.append(err / ref)
+  return jnp.mean(jnp.stack(terms, axis=0), axis=0)
+
+
+def multiscale_log_rms_loss(
+  y: jnp.ndarray,
+  x: jnp.ndarray,
+  *,
+  sample_rate_hz: float = 32000.0,
+  windows_ms: Sequence[float] = (12.5, 50.0),
+  eps: float = 1e-4,
+) -> jnp.ndarray:
+  """Computes per-clip global + local frame log-RMS envelope L1 distance."""
+  if y.shape != x.shape:
+    raise ValueError(f"y {y.shape} and x {x.shape} differ in shape.")
+  ry = jnp.sqrt(jnp.mean(jnp.square(y), axis=1) + 1e-12)
+  rx = jnp.sqrt(jnp.mean(jnp.square(x), axis=1) + 1e-12)
+  terms: list[jnp.ndarray] = [jnp.abs(jnp.log(ry + eps) - jnp.log(rx + eps))]
+  for w_ms in windows_ms:
+    win = max(1, int(round(float(w_ms) * 1e-3 * float(sample_rate_hz))))
+    n_f = x.shape[1] // win
+    if n_f > 0:
+      yf = y[:, : n_f * win].reshape(y.shape[0], n_f, win)
+      xf = x[:, : n_f * win].reshape(x.shape[0], n_f, win)
+      r_yf = jnp.sqrt(jnp.mean(jnp.square(yf), axis=2) + 1e-12)
+      r_xf = jnp.sqrt(jnp.mean(jnp.square(xf), axis=2) + 1e-12)
+      terms.append(
+        jnp.mean(jnp.abs(jnp.log(r_yf + eps) - jnp.log(r_xf + eps)), axis=1)
+      )
+  return jnp.mean(jnp.stack(terms, axis=0), axis=0)
 
 
 def stft_loss(
@@ -200,6 +328,29 @@ def multi_resolution_stft_loss(
     "spectral_convergence": sc,
     "log_magnitude": log_mag,
   }
+
+
+def spectral_excess_loss(
+  y: jnp.ndarray,
+  x: jnp.ndarray,
+  resolutions: Sequence[tuple[int, int, int]] = STFT_RESOLUTIONS_32K,
+  eps: float = 1e-5,
+) -> jnp.ndarray:
+  """Asymmetric squared penalty on positive log-STFT magnitude excess."""
+  if y.shape != x.shape:
+    raise ValueError(f"y {y.shape} and x {x.shape} differ in shape.")
+  valid = [r for r in resolutions if x.shape[1] > r[0] // 2]
+  if not valid:
+    raise ValueError(
+      f"Sequence length {x.shape[1]} too short for resolutions {resolutions}."
+    )
+  terms: list[jnp.ndarray] = []
+  for n_fft, hop, win_len in valid:
+    mag_y = stft_magnitude(y, n_fft, hop, win_len, eps=eps**2)
+    mag_x = stft_magnitude(x, n_fft, hop, win_len, eps=eps**2)
+    excess = jax.nn.relu(jnp.log(mag_y + eps) - jnp.log(mag_x + eps))
+    terms.append(jnp.mean(excess * excess))
+  return jnp.mean(jnp.stack(terms))
 
 
 class PeriodDiscriminator(nn.Module):
@@ -364,6 +515,15 @@ def feature_matching_loss(
   return total
 
 
+def _masked_mean_value(
+  per_clip: jnp.ndarray, weights: jnp.ndarray
+) -> jnp.ndarray:
+  active_mask = weights > 0.0
+  return jnp.sum(jnp.where(active_mask, per_clip, 0.0)) / jnp.maximum(
+    jnp.sum(active_mask), 1
+  )
+
+
 def compute_arcfac_inverter_loss(
   y: jnp.ndarray,
   x: jnp.ndarray,
@@ -373,14 +533,25 @@ def compute_arcfac_inverter_loss(
   lookahead: int = 256,
   mask_samples: int = 8000,
   output_scale: float = 1.0,
+  nap_weight: float = 1.0,
+  relative_nap: bool = False,
   lam: jnp.ndarray | float = 0.01,
   warmup_weight: float = 0.01,
   stft_weight: jnp.ndarray | float = 0.0,
   apply_stft: bool = False,
+  excess_stft_weight: jnp.ndarray | float = 0.0,
+  apply_excess_stft: bool = False,
+  mel_weight: jnp.ndarray | float = 0.0,
+  apply_mel: bool = False,
+  lf_complex_weight: jnp.ndarray | float = 0.0,
+  apply_lf_complex: bool = False,
+  rms_env_weight: jnp.ndarray | float = 0.0,
+  apply_rms_env: bool = False,
+  sample_rate_hz: float = 32000.0,
   sai_weight: float = 0.0,
   stft_resolutions: Sequence[tuple[int, int, int]] = STFT_RESOLUTIONS_32K,
 ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
-  """Computes the masked NAP/SAI + healthy-only tie-breaker loss from ``arcfac``.
+  """Computes the masked NAP/SAI + perceptual/phase-free vocoder losses.
 
   Args:
     y: Predicted waveforms of shape ``(batch, samples)``.
@@ -391,14 +562,28 @@ def compute_arcfac_inverter_loss(
     lookahead: Causal lookahead delay ``L`` applied to ``nap_target`` and ``x``.
     mask_samples: Prefix samples ignored by CARFAC loss (start-from-rest mask).
     output_scale: Corpus RMS floor preventing quiet-clip gradient spikes.
+    nap_weight: Scalar multiplier on cochlear NAP L1 consistency (setting to
+      ``0.0`` alongside ``sai_weight=0.0`` skips running the CARFAC forward
+      and backward pass completely).
+    relative_nap: When ``True``, normalizes each stream's NAP L1 loss by its
+      target steady-state NAP magnitude so quiet impaired ears keep equal weight.
     lam: Waveform L1 tie-breaker weight (scalar or ``(batch,)`` with ``0`` for
       impaired targets so outputs do not regress toward un-impaired ``x``).
     warmup_weight: Weight on normalized prefix energy before ``start``.
     stft_weight: Multi-resolution STFT weight (scalar or ``(batch,)`` with
       ``0`` on impaired targets).
     apply_stft: Static switch enabling MR-STFT computation when ``stft_weight > 0``.
-    sai_weight: Optional weight on unmasked healthy CARFAC SAI L1 consistency
-      (applies cleanly to both healthy and impaired ears).
+    excess_stft_weight: Weight on ``spectral_excess_loss`` penalizing predicted
+      spectral peaks above target (can target all ears safely).
+    apply_excess_stft: Static switch enabling ``spectral_excess_loss``.
+    mel_weight: Multi-scale log-mel L1 loss weight (phase-invariant).
+    apply_mel: Static switch enabling multi-scale log-mel loss.
+    lf_complex_weight: Low-frequency complex STFT L2 loss weight.
+    apply_lf_complex: Static switch enabling low-frequency complex STFT loss.
+    rms_env_weight: Multi-scale log-RMS envelope L1 loss weight.
+    apply_rms_env: Static switch enabling multi-scale log-RMS envelope loss.
+    sample_rate_hz: Audio sample rate in Hz for mel/LF/RMS frequency grids.
+    sai_weight: Optional weight on unmasked healthy CARFAC SAI L1 consistency.
     stft_resolutions: STFT window specs for MR-STFT loss.
 
   Returns:
@@ -410,19 +595,34 @@ def compute_arcfac_inverter_loss(
       f"Sequence length {y.shape[1]} leaves no samples past start={start}."
     )
 
-  nap_y = healthy_ear_fn(y)
+  use_cochlea = nap_weight > 0.0 or sai_weight > 0.0
   tgt_delayed = delay_samples(nap_target, lookahead, axis=1)
-  nap_steady = jnp.mean(
-    jnp.abs(nap_y[:, start:] - tgt_delayed[:, start:]), axis=(1, 2)
-  )
-  if start > lookahead:
-    nap_onset = jnp.mean(
-      jnp.abs(nap_y[:, lookahead:start] - tgt_delayed[:, lookahead:start]),
-      axis=(1, 2),
-    )
-    nap_total = nap_steady + 0.25 * nap_onset
+  if use_cochlea:
+    nap_y = healthy_ear_fn(y)
   else:
-    nap_total = nap_steady
+    nap_y = jnp.zeros_like(tgt_delayed)
+
+  if nap_weight > 0.0:
+    nap_steady = jnp.mean(
+      jnp.abs(nap_y[:, start:] - tgt_delayed[:, start:]), axis=(1, 2)
+    )
+    if start > lookahead:
+      nap_onset = jnp.mean(
+        jnp.abs(nap_y[:, lookahead:start] - tgt_delayed[:, lookahead:start]),
+        axis=(1, 2),
+      )
+      nap_total = nap_steady + 0.25 * nap_onset
+    else:
+      nap_total = nap_steady
+    if relative_nap:
+      nap_denom = jnp.maximum(
+        jnp.mean(jnp.abs(tgt_delayed[:, start:]), axis=(1, 2)), 1e-4
+      )
+      nap_total = nap_total / nap_denom
+    nap_term = jnp.float32(nap_weight) * nap_total
+  else:
+    nap_steady = jnp.zeros((y.shape[0],), dtype=jnp.float32)
+    nap_term = nap_steady
 
   x_delayed = delay_samples(x, lookahead, axis=1)
   abs_floor = max(0.1 * float(output_scale), 1e-7)
@@ -446,7 +646,7 @@ def compute_arcfac_inverter_loss(
 
   lam_arr = jnp.asarray(lam, dtype=jnp.float32)
   total_per_clip = (
-    nap_total + lam_arr * wave_per_clip + warmup_weight * warm_per_clip
+    nap_term + lam_arr * wave_per_clip + warmup_weight * warm_per_clip
   )
 
   if sai_weight > 0.0:
@@ -470,20 +670,62 @@ def compute_arcfac_inverter_loss(
   else:
     sai_mean = jnp.float32(0.0)
 
+  y_seg = y[:, lookahead:]
+  x_seg = x_delayed[:, lookahead:]
+
   if apply_stft:
     stft_w = jnp.asarray(stft_weight, dtype=jnp.float32)
     stft_per_clip = jax.vmap(
       lambda a, b: multi_resolution_stft_loss(
         a[None, :], b[None, :], resolutions=stft_resolutions
       )[0]
-    )(y[:, lookahead:], x_delayed[:, lookahead:])
+    )(y_seg, x_seg)
     total_per_clip = total_per_clip + stft_w * stft_per_clip
-    active_mask = stft_w > 0.0
-    stft_mean = jnp.sum(
-      jnp.where(active_mask, stft_per_clip, 0.0)
-    ) / jnp.maximum(jnp.sum(active_mask), 1)
+    stft_mean = _masked_mean_value(stft_per_clip, stft_w)
   else:
     stft_mean = jnp.float32(0.0)
+
+  if apply_excess_stft:
+    ex_w = jnp.asarray(excess_stft_weight, dtype=jnp.float32)
+    ex_per_clip = jax.vmap(
+      lambda a, b: spectral_excess_loss(
+        a[None, :], b[None, :], resolutions=stft_resolutions
+      )
+    )(y_seg, x_seg)
+    total_per_clip = total_per_clip + ex_w * ex_per_clip
+    excess_mean = _masked_mean_value(ex_per_clip, ex_w)
+  else:
+    excess_mean = jnp.float32(0.0)
+
+  if apply_mel:
+    mel_w = jnp.asarray(mel_weight, dtype=jnp.float32)
+    mel_per_clip = multi_scale_mel_loss(
+      y_seg, x_seg, sample_rate_hz=sample_rate_hz
+    )
+    total_per_clip = total_per_clip + mel_w * mel_per_clip
+    mel_mean = _masked_mean_value(mel_per_clip, mel_w)
+  else:
+    mel_mean = jnp.float32(0.0)
+
+  if apply_lf_complex:
+    lf_w = jnp.asarray(lf_complex_weight, dtype=jnp.float32)
+    lf_per_clip = low_freq_complex_stft_loss(
+      y_seg, x_seg, sample_rate_hz=sample_rate_hz
+    )
+    total_per_clip = total_per_clip + lf_w * lf_per_clip
+    lf_mean = _masked_mean_value(lf_per_clip, lf_w)
+  else:
+    lf_mean = jnp.float32(0.0)
+
+  if apply_rms_env:
+    rms_w = jnp.asarray(rms_env_weight, dtype=jnp.float32)
+    rms_per_clip = multiscale_log_rms_loss(
+      y_seg, x_seg, sample_rate_hz=sample_rate_hz
+    )
+    total_per_clip = total_per_clip + rms_w * rms_per_clip
+    rms_mean = _masked_mean_value(rms_per_clip, rms_w)
+  else:
+    rms_mean = jnp.float32(0.0)
 
   loss = jnp.mean(total_per_clip)
   return loss, {
@@ -493,4 +735,8 @@ def compute_arcfac_inverter_loss(
     "l1_waveform": cast(jnp.ndarray, jnp.mean(wave_per_clip)),
     "warmup_energy": cast(jnp.ndarray, jnp.mean(warm_per_clip)),
     "stft": cast(jnp.ndarray, stft_mean),
+    "excess_stft": cast(jnp.ndarray, excess_mean),
+    "mel": cast(jnp.ndarray, mel_mean),
+    "lf_complex": cast(jnp.ndarray, lf_mean),
+    "rms_env": cast(jnp.ndarray, rms_mean),
   }

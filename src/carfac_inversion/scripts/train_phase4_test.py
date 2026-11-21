@@ -75,6 +75,87 @@ class TrainPhase4Test(absltest.TestCase):
       self.assertEqual(loaded_cfg.architecture, "cochlea_hybrid")
       self.assertGreater(res["params"], 0)
 
+  def test_phase4_strobe_sai_input_smoke(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      out_dir = pathlib.Path(tmp) / "p4_strobe_smoke"
+      res = train_phase4.run_phase4_training(
+        output_dir=str(out_dir),
+        architecture="cochlea_hybrid",
+        width=16,
+        num_blocks=3,
+        coarse_dim=16,
+        coarse_hop=32,
+        lookahead=32,
+        sample_rate_hz=16000,
+        seconds=0.32,
+        mask_seconds=0.064,
+        lam=0.0,
+        stft_weight=0.05,
+        excess_stft_weight=0.05,
+        sai_weight=0.10,
+        strobe_sai_input=True,
+        steps=2,
+        gan_steps=1,
+        batch_size=2,
+        grad_accum_steps=1,
+        steps_per_loop=2,
+        eval_every=2,
+        eval_clips_count=1,
+        score_seconds=0.25,
+        seed=1,
+      )
+      ckpt = pathlib.Path(res["checkpoint_path"])
+      self.assertTrue(ckpt.is_file())
+      self.assertTrue((out_dir / "checkpoint_gan.npz").is_file())
+      self.assertTrue((out_dir / "config.json").is_file())
+      cfg_text = (out_dir / "config.json").read_text()
+      self.assertIn('"strobe_sai_input": true', cfg_text)
+
+  def test_phase4_strobe_sai_phase_free_losses_smoke(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      out_dir = pathlib.Path(tmp) / "p4_strobe_phase_free"
+      res = train_phase4.run_phase4_training(
+        output_dir=str(out_dir),
+        architecture="cochlea_hybrid",
+        width=16,
+        num_blocks=3,
+        coarse_dim=16,
+        coarse_hop=32,
+        lookahead=32,
+        sample_rate_hz=16000,
+        seconds=0.32,
+        mask_seconds=0.064,
+        nap_weight=0.0,
+        relative_nap=False,
+        lam=0.0,
+        lam_impaired=0.0,
+        stft_weight=0.25,
+        mel_weight=1.0,
+        lf_complex_weight=0.5,
+        rms_env_weight=0.5,
+        excess_stft_weight=0.1,
+        excess_all_ears=True,
+        sai_weight=0.0,
+        zero_resting_gate=True,
+        strobe_sai_input=True,
+        steps=2,
+        gan_steps=1,
+        batch_size=2,
+        grad_accum_steps=1,
+        steps_per_loop=2,
+        eval_every=2,
+        eval_clips_count=1,
+        score_seconds=0.25,
+        seed=2,
+      )
+      self.assertTrue((out_dir / "checkpoint_last.npz").is_file())
+      self.assertTrue((out_dir / "checkpoint_gan.npz").is_file())
+      self.assertGreater(res["params"], 0)
+      cfg_text = (out_dir / "config.json").read_text()
+      self.assertIn('"nap_weight": 0.0', cfg_text)
+      self.assertIn('"excess_all_ears": true', cfg_text)
+      self.assertIn('"mel_weight": 1.0', cfg_text)
+
 
 if __name__ == "__main__":
   absltest.main()

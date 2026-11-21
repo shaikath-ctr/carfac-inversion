@@ -40,6 +40,10 @@ Build a world-class, state-of-the-art CARFAC neural activity pattern (NAP)-to-au
   - Built `SaiDirectInverter` (`5.26M` params: high-CF unresolved harmonic-summed SACF pitch + DDSP `48`-harmonic bank + COLA `n_fft=1024, hop=128` STFT-filtered white noise + chunked modular phase integration) and Stage 1 + 1D MPD/MRD GAN training (`sai_inverter.py`, `train_sai.py`).
   - On unseen `dev-clean/test` (`7976-105575-0000`, `2.0 s @ 32 kHz`), outperforms `AFHI/arcfac` SAI baselines on **`HASQI` (`0.500` vs `0.344` `randphase` / `0.272` `noise` / `0.177` `slaney`)**, **`log_stft` (`0.181` vs `0.468 / 2.238 / 1.802`)**, **`STOI` (`0.912`)**, **`HASPI` (`0.860`)**, `flat:0.5` direction (`sai_dir = 1.006`, `sai_kept = 0.055`), **`sai_rt_rel` vs `arcfac_slaney` (`0.361` vs `0.856`)**, and **`>10,000x` faster warm inference (`0.08 s` vs `798–856 s`)**.
   - Generalizes across `5`-clip `dev-clean/test` (`HASQI = 0.472`, `log_stft = 0.164`, `sai_rt_rel = 0.390`), `train-clean-100/test` (`HASQI = 0.415`, `sai_rt_rel = 0.364`, `flat:0.5 sai_kept = 0.033`, `sai_dir = 1.004`), and `30–95 dB SPL` (`HASQI = 0.576 -> 0.322`, `sai_rt_rel = 0.453 -> 0.330`).
+- **Phase 4 `v3` & `18.0 ms` Causal Strobe-SAI (`tc100_gan_v3`, `tc100_strobe_sai_v3`)**:
+  - Added causal resting-silence AC gate (`zero_resting_gate`, suppressing resting silence floor to `-199.2 dB SPL`), basal traveling-wave dispersion alignment option (`causal_dispersion_align`), and multi-scale mel/low-frequency complex/log-RMS envelope + `--relative_nap` polish (`cochlea_hybrid_32k_tc100_gan_v3`), preserving **`+24.28 dB` SI-SDR / `0.950` HASQI / `0.072` `nap_rt_rel` / `0.052` `sai_rt_rel` / `0.032` `log_stft`** across `5` unseen `dev-clean/test` clips (`flat:0.5 nap_kept = 0.206`, `nap_dir = 1.017`, `sai_dir = 1.020`).
+  - Added strictly causal 2-trigger strobe-SAI decoding (`causal_strobe_sai_to_nap`, `invert_strobe_sai_causal`: `10 ms` OLA hop + `8 ms` causal decoder = **`18.0 ms` algorithmic latency**) and `--strobe_sai_input` fine-tuned decoder (`cochlea_hybrid_32k_tc100_strobe_sai_v3`, `-174.7 dB SPL` resting silence, **`0.160` `log_stft` / `0.348` `HASQI` / `0.606` `sai_rt_rel`** on `5`-clip `dev-clean/test`).
+- **AFHI Engineering Conventions Alignment**: Added `.afhi/` (`CONVENTIONS.md`, `python.md`, `research.md`, `index.md`, `REVISION`), `AGENTS.md`, and `CLAUDE.md` aligned with `Australian-Future-Hearing-Initiative/afhi-conventions` (`6e7b24f`).
 
 ---
 
@@ -49,7 +53,7 @@ Build a world-class, state-of-the-art CARFAC neural activity pattern (NAP)-to-au
 - **Target Repository**: `/usr/local/google/home/shaikath/Projects/carfac-inversion`
 - **Virtual Environment**: `.venv` synchronized via `uv` using Python 3.12.16 (`cpython-3.12.16-linux-x86_64-gnu`).
 - **Dependencies Status**: All packages installed and verified (`carfac[jax]` @ `4cdb95e`, `hp-acoustic` @ `7d913ac`, `jax-haspi-hasqi` @ `f6601d4`, `jax==0.10.2`, `jaxlib==0.10.2`, `optax==0.2.9`, `grain`, `pystoi`, `pytest==9.2.0`, `ruff==0.17.5`).
-- **Test Suite Verification**: **73 / 73 tests passing** (`ruff format --check .`, `ruff check .`, `pyrefly check`, and `pytest -v` all clean).
+- **Test Suite Verification**: **81 / 81 tests passing** (`ruff format --check .`, `ruff check .`, `pyrefly check`, and `pytest -q` all clean).
 
 ### Historical Reference Metrics (Phases 0–3b)
 - **Phase 0–3b Test Suite**: 34 tests defined across `inversion_test.py` (17), `neural_test.py` (7), `benchmark_suite_test.py` (6), and `invert_nap_test.py` (4).

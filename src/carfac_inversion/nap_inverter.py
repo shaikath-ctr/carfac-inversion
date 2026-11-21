@@ -52,6 +52,8 @@ class DirectInverterConfig:
   conditioned: bool = False
   cond_dim: int = 3
   max_log_gain: float = 2.5
+  dispersion_align: bool = False
+  zero_resting_gate: bool = False
 
   def __post_init__(self) -> None:
     """Validates architectural hyperparameters."""
@@ -245,6 +247,88 @@ _RematHybridBlock = cast(
 )
 
 
+@functools.lru_cache(maxsize=8)
+def compute_open_loop_bm_delays(fs: float, n_channels: int) -> np.ndarray:
+  """Returns per-channel CARFAC traveling-wave peak delays in samples at ``fs``."""
+  if n_channels < 1:
+    raise ValueError(f"n_channels must be positive, got {n_channels}.")
+  with tpu.host_cpu_context():
+    cm = carfac.build(fs=float(fs))
+    if int(cm.num_channels) == int(n_channels):
+      win_len = min(2048, max(128, int(round(0.04 * float(fs)))))
+      cpu_dev = jax.local_devices(backend="cpu")[0]
+      imp = (
+        jnp.zeros((win_len, 1), dtype=jnp.float32, device=cpu_dev)
+        .at[0, 0]
+        .set(1e-3)
+      )
+      sil = jnp.zeros((win_len, 1), dtype=jnp.float32, device=cpu_dev)
+      ir = np.asarray(
+        jax.jit(lambda x, z: cm(x)[:, :, 0] - cm(z)[:, :, 0])(imp, sil),
+        dtype=np.float32,
+      )
+      k = max(3, int(round(float(fs) / 2000.0)))
+      env = np.apply_along_axis(
+        lambda v: np.convolve(
+          np.abs(v), np.ones(k, dtype=np.float32) / k, "same"
+        ),
+        0,
+        ir,
+      )
+      return np.argmax(env, axis=0).astype(np.float32)
+    cfs = np.asarray(cm.channel_frequencies, dtype=np.float32)
+  # Fallback analytic ERB traveling-wave delay profile for synthetic channel counts.
+  lo, hi = float(np.min(cfs)), float(np.max(cfs))
+  synth_cfs = np.geomspace(max(lo, 20.0), max(hi, 40.0), num=n_channels)[::-1]
+  delay_sec = 0.085 / (4.37 * synth_cfs / 1000.0 + 1.0)
+  return (delay_sec * float(fs)).astype(np.float32)
+
+
+def causal_dispersion_align(
+  nap: jnp.ndarray,
+  *,
+  fs: float,
+  lookahead: int,
+) -> jnp.ndarray:
+  """Aligns fast basal channels backward into causal history (zero lookahead)."""
+  if lookahead <= 0:
+    return nap
+  _, t_len, n_ch = nap.shape
+  tau = compute_open_loop_bm_delays(float(fs), int(n_ch))
+  delta = np.maximum(0.0, float(lookahead) - tau).astype(np.float32)
+  d0 = np.floor(delta).astype(np.int32)
+  d1 = np.ceil(delta).astype(np.int32)
+  frac = jnp.asarray((delta - d0)[None, None, :], dtype=nap.dtype)
+  pad_max = int(np.max(d1))
+  if pad_max == 0:
+    return nap
+  padded = jnp.pad(nap, ((0, 0), (pad_max, 0), (0, 0)), mode="edge")
+  t_ax = jnp.arange(t_len, dtype=jnp.int32)[:, None] + pad_max
+  idx0 = t_ax - jnp.asarray(d0[None, :], dtype=jnp.int32)
+  idx1 = t_ax - jnp.asarray(d1[None, :], dtype=jnp.int32)
+  ch_ax = jnp.arange(n_ch, dtype=jnp.int32)[None, :]
+  v0 = padded[:, idx0, ch_ax]
+  v1 = padded[:, idx1, ch_ax]
+  return (1.0 - frac) * v0 + frac * v1
+
+
+def _causal_boxcar_mean(x: jnp.ndarray, win: int) -> jnp.ndarray:
+  """Computes strictly causal edge-padded moving average along axis 1."""
+  if win <= 1:
+    return x
+  pad_x = jnp.pad(x, ((0, 0), (win - 1, 0), (0, 0)), mode="edge")
+  n_ch = int(x.shape[-1])
+  kernel = jnp.ones((win, 1, n_ch), dtype=jnp.float32) / float(win)
+  return jax.lax.conv_general_dilated(
+    pad_x.astype(jnp.float32),
+    kernel,
+    window_strides=(1,),
+    padding="VALID",
+    feature_group_count=n_ch,
+    dimension_numbers=("NWC", "WIO", "NWC"),
+  ).astype(x.dtype)
+
+
 class CochleaDirectInverter(nn.Module):
   """Phase 4 causal direct NAP-to-audio inverter supporting multiple backbones."""
 
@@ -258,6 +342,8 @@ class CochleaDirectInverter(nn.Module):
   ) -> jnp.ndarray:
     """Inverts centered/raw cochleotopic NAP ``(batch, samples, ch)`` to audio."""
     cfg = self.config
+    if cfg.dispersion_align:
+      nap = causal_dispersion_align(nap, fs=cfg.fs, lookahead=cfg.lookahead)
     nap_scaled = nap / max(float(cfg.input_scale), 1e-8)
     cond_flat: jnp.ndarray | None = None
     if cfg.conditioned:
@@ -396,6 +482,11 @@ class CochleaDirectInverter(nn.Module):
       bias_init=nn.initializers.zeros_init(),
     )(c_up)[..., 0]
     y = (y_fine + y_coarse) * gain_t * float(cfg.output_scale)
+    if cfg.zero_resting_gate:
+      ac = nap_scaled - _causal_boxcar_mean(nap_scaled, 64)
+      ac_pow = jnp.mean(ac * ac, axis=-1, keepdims=True)
+      ac_rms = jnp.sqrt(_causal_boxcar_mean(ac_pow, 256)[:, :, 0] + 1e-16)
+      y = y * jnp.tanh((ac_rms / 2e-4) ** 2)
     if cfg.output_highpass_hz > 0.0:
       y = vocoder_losses.causal_highpass(
         y, cutoff_hz=cfg.output_highpass_hz, fs=cfg.fs
@@ -431,6 +522,9 @@ def _load_direct_cached(
       for k in data.files
       if k != "__config_json__"
     }
+  if config.dispersion_align:
+    n_ch_default = int(carfac.channel_frequencies_for_rate(config.fs).shape[0])
+    compute_open_loop_bm_delays(float(config.fs), n_ch_default)
   params = traverse_util.unflatten_dict(flat, sep="/")
   return CochleaDirectInverter(config=config), params, config
 

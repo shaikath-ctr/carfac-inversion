@@ -10,6 +10,7 @@ import numpy as np
 from absl.testing import absltest
 from hp_acoustic.models import carfac
 
+from carfac_inversion import nap_inverter
 from carfac_inversion import sai_inverter
 from carfac_inversion.scripts import benchmark_arcfac
 
@@ -77,6 +78,40 @@ class BenchmarkArcfacTest(absltest.TestCase):
       )
       self.assertLen(rows, 1)
       self.assertTrue(np.isfinite(float(rows[0]["arcfac_sai_round_trip_rel"])))
+
+  def test_run_arcfac_benchmark_strobe_sai_direct_smoke(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      root = pathlib.Path(tmp_dir)
+      cfg = nap_inverter.DirectInverterConfig(
+        architecture="cochlea_hybrid",
+        width=16,
+        num_blocks=3,
+        coarse_dim=16,
+        coarse_hop=32,
+        lookahead=32,
+        fs=16000.0,
+      )
+      model = nap_inverter.CochleaDirectInverter(config=cfg)
+      n_ch = int(carfac.channel_frequencies_for_rate(16000).shape[0])
+      params = model.init(
+        jax.random.PRNGKey(0),
+        jnp.zeros((1, 128, n_ch), dtype=jnp.float32),
+      )
+      ckpt = root / "strobe_sai_ft.npz"
+      nap_inverter.save_direct_checkpoint(ckpt, params, cfg)
+      rows = benchmark_arcfac.run_arcfac_benchmark(
+        input_dir=None,
+        output_dir=str(root / "out"),
+        max_clips=1,
+        clip_seconds=0.25,
+        sample_rate_hz=16000,
+        targets=("healthy",),
+        methods=("strobe_sai_direct",),
+        strobe_sai_checkpoint=str(ckpt),
+        seed=0,
+      )
+      self.assertLen(rows, 1)
+      self.assertTrue(np.isfinite(float(rows[0]["arcfac_nap_round_trip_rel"])))
 
   def test_missing_arcfac_raises_clear_import_error(self):
     with self.assertRaisesRegex(ImportError, "arcfac"):

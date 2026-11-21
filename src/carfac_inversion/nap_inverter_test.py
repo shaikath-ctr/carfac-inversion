@@ -158,6 +158,74 @@ class NapInverterTest(parameterized.TestCase):
       y_merged[:, :128], y_fut[:, :128], atol=1e-6, rtol=1e-6
     )
 
+  def test_v2_dispersion_align_causality_and_resting_gate(self):
+    cfg = nap_inverter.DirectInverterConfig(
+      architecture="cochlea_hybrid",
+      width=16,
+      num_blocks=3,
+      coarse_dim=16,
+      coarse_hop=32,
+      coarse_dilations=(1, 2),
+      lookahead=64,
+      output_highpass_hz=20.0,
+      fs=32000.0,
+      dispersion_align=True,
+      zero_resting_gate=True,
+    )
+    model = nap_inverter.CochleaDirectInverter(config=cfg)
+    rng = np.random.default_rng(19)
+    nap_a = jnp.asarray(
+      0.04 * rng.standard_normal((1, 300, 10)), dtype=jnp.float32
+    )
+    params = model.init(jax.random.PRNGKey(4), nap_a)
+
+    # Exact Jacobian check: output at sample t_probe must not depend on t > t_probe.
+    t_probe = 180
+
+    def _probe(x: jnp.ndarray) -> jnp.ndarray:
+      return jnp.asarray(model.apply(params, x))[0, t_probe]
+
+    jac = np.asarray(jax.jacrev(_probe)(nap_a))
+    future_grad = float(np.max(np.abs(jac[:, t_probe + 1 :, :])))
+    self.assertEqual(future_grad, 0.0)
+
+    # Constant resting NAP (AC fluctuation == 0) must yield near-exact zero output.
+    nap_rest = jnp.full((2, 400, 10), 0.085, dtype=jnp.float32)
+    y_rest = np.asarray(model.apply(params, nap_rest))
+    self.assertLess(float(np.max(np.abs(y_rest))), 1e-6)
+
+  def test_load_dispersion_align_checkpoint_prewarms_cache_before_jit(self):
+    from hp_acoustic.models import carfac  # noqa: PLC0415
+
+    n_ch = int(carfac.channel_frequencies_for_rate(16000.0).shape[0])
+    cfg = nap_inverter.DirectInverterConfig(
+      architecture="cochlea_hybrid",
+      width=16,
+      num_blocks=3,
+      coarse_dim=16,
+      coarse_hop=32,
+      coarse_dilations=(1, 2),
+      lookahead=64,
+      fs=16000.0,
+      dispersion_align=True,
+      zero_resting_gate=True,
+    )
+    model = nap_inverter.CochleaDirectInverter(config=cfg)
+    params = model.init(jax.random.PRNGKey(5), jnp.zeros((1, 128, n_ch)))
+    with tempfile.TemporaryDirectory() as tmp:
+      ckpt = pathlib.Path(tmp) / "disp_v2.npz"
+      nap_inverter.save_direct_checkpoint(ckpt, params, cfg)
+      nap_inverter.compute_open_loop_bm_delays.cache_clear()
+      loaded_m, loaded_p, _ = nap_inverter.load_direct_checkpoint(ckpt)
+      self.assertEqual(
+        nap_inverter.compute_open_loop_bm_delays.cache_info().currsize, 1
+      )
+      y = np.asarray(
+        jax.jit(loaded_m.apply)(loaded_p, jnp.zeros((1, 128, n_ch)))
+      )
+      self.assertEqual(y.shape, (1, 128))
+      self.assertTrue(np.all(np.isfinite(y)))
+
 
 if __name__ == "__main__":
   absltest.main()
